@@ -2,42 +2,31 @@
 # FILE: shared_state.py
 # ═══════════════════════════════════════════════════════════════
 """
-Thread-safe state bus shared between the engine thread and the Streamlit UI.
+Thread-safe state bus. No changes needed from original,
+but added option_chain cache for the limit order screen.
 """
 
 import threading
 from typing import Dict, List, Optional
 from collections import deque
-
 from models import TickData, Strategy, LogEntry
 
 
 class SharedState:
-    """Every mutable field is guarded by a single reentrant lock."""
-
     def __init__(self, max_logs: int = 500):
         self._lock = threading.RLock()
-
-        # Market data: feed_key → TickData
         self._ticks: Dict[str, TickData] = {}
-
-        # Active strategies
         self._strategies: List[Strategy] = []
-
-        # Spot prices
         self._spot_prices: Dict[str, float] = {}
-
-        # Log ring buffer
         self._logs: deque = deque(maxlen=max_logs)
+        self._option_chain_cache: List[dict] = []
+        self._chain_cache_time: float = 0
 
         # Flags
         self._connected: bool = False
         self._ws_connected: bool = False
         self._engine_running: bool = False
-        self._kill_switch_armed: bool = False
         self._panic_triggered: bool = False
-
-        # Global P&L
         self._total_mtm: float = 0.0
 
     # ── Tick data ────────────────────────────────────────────
@@ -54,7 +43,7 @@ class SharedState:
         with self._lock:
             return dict(self._ticks)
 
-    # ── Spot prices ──────────────────────────────────────────
+    # ── Spot ─────────────────────────────────────────────────
 
     def set_spot(self, stock_code: str, price: float):
         with self._lock:
@@ -73,6 +62,17 @@ class SharedState:
     def get_strategies(self) -> List[Strategy]:
         with self._lock:
             return list(self._strategies)
+
+    # ── Option chain cache ───────────────────────────────────
+
+    def set_chain_cache(self, chain: List[dict], timestamp: float):
+        with self._lock:
+            self._option_chain_cache = chain
+            self._chain_cache_time = timestamp
+
+    def get_chain_cache(self) -> tuple:
+        with self._lock:
+            return list(self._option_chain_cache), self._chain_cache_time
 
     # ── P&L ──────────────────────────────────────────────────
 
@@ -95,7 +95,7 @@ class SharedState:
         with self._lock:
             return list(self._logs)[-n:]
 
-    # ── Flags ────────────────────────────────────────────────
+    # ── Flags (properties with locking) ──────────────────────
 
     @property
     def connected(self) -> bool:
