@@ -2,13 +2,14 @@
 # FILE: utils.py
 # ═══════════════════════════════════════════════════════════════
 """
-Logging bootstrap and date/time helpers.
+Logging, date helpers, and Breeze format utilities.
+Deep-studied against Breeze SDK source.
 """
 
 import logging
 import sys
+import calendar
 from datetime import datetime, timedelta
-from typing import Optional
 from config import Config
 
 
@@ -30,47 +31,71 @@ def setup_logging() -> logging.Logger:
 LOG = setup_logging()
 
 
-def breeze_date(dt: datetime) -> str:
-    """Format a datetime into Breeze ISO-style: '2024-01-25T06:00:00.000Z'"""
+def breeze_expiry_format(dt: datetime) -> str:
+    """
+    Breeze SDK expects expiry_date in ISO format:
+      '2024-01-25T06:00:00.000Z'
+    
+    CRITICAL: Breeze uses this exact format for:
+      - subscribe_feeds(expiry_date=...)
+      - get_option_chain_quotes(expiry_date=...)
+      - place_order(expiry_date=...)
+    
+    The T06:00:00.000Z suffix is mandatory for NFO.
+    """
     return dt.strftime("%Y-%m-%dT06:00:00.000Z")
 
 
+def breeze_strike_format(strike: float) -> str:
+    """
+    Breeze SDK expects strike_price as a string.
+    For subscribe_feeds: "23500"
+    For place_order: "23500"
+    Always integer, no decimals.
+    """
+    return str(int(strike))
+
+
 def next_weekly_expiry(stock_code: str = "NIFTY") -> datetime:
-    """Return the next Thursday (NIFTY weekly expiry) from today."""
+    """
+    Return the next Thursday (NSE weekly expiry).
+    If today IS Thursday and before 15:30, return today.
+    """
     today = datetime.now()
     days_ahead = 3 - today.weekday()  # Thursday = 3
-    if days_ahead < 0 or (days_ahead == 0 and today.hour >= 15):
+    if days_ahead < 0:
         days_ahead += 7
-    return today + timedelta(days=days_ahead)
+    elif days_ahead == 0 and today.hour >= 16:
+        days_ahead = 7
+    return (today + timedelta(days=days_ahead)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
 
 def next_monthly_expiry() -> datetime:
     """Return the last Thursday of the current month."""
     today = datetime.now()
-    import calendar
     last_day = calendar.monthrange(today.year, today.month)[1]
     dt = datetime(today.year, today.month, last_day)
     while dt.weekday() != 3:
         dt -= timedelta(days=1)
     if dt.date() < today.date():
         if today.month == 12:
-            next_month = datetime(today.year + 1, 1, 1)
+            nm = datetime(today.year + 1, 1, 1)
         else:
-            next_month = datetime(today.year, today.month + 1, 1)
-        last_day2 = calendar.monthrange(next_month.year, next_month.month)[1]
-        dt = datetime(next_month.year, next_month.month, last_day2)
+            nm = datetime(today.year, today.month + 1, 1)
+        last_day2 = calendar.monthrange(nm.year, nm.month)[1]
+        dt = datetime(nm.year, nm.month, last_day2)
         while dt.weekday() != 3:
             dt -= timedelta(days=1)
     return dt
 
 
 def atm_strike(spot_price: float, gap: int) -> float:
-    """Round to the nearest option strike gap."""
     return round(spot_price / gap) * gap
 
 
 def is_market_hours() -> bool:
-    """Check if current time is within NSE market hours (9:15 – 15:30 IST)."""
     now = datetime.now()
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -78,6 +103,8 @@ def is_market_hours() -> bool:
 
 
 def safe_float(val, default: float = 0.0) -> float:
+    if val is None:
+        return default
     try:
         return float(val)
     except (TypeError, ValueError):
@@ -85,7 +112,27 @@ def safe_float(val, default: float = 0.0) -> float:
 
 
 def safe_int(val, default: int = 0) -> int:
+    if val is None:
+        return default
     try:
-        return int(val)
+        return int(float(val))
     except (TypeError, ValueError):
         return default
+
+
+def parse_breeze_datetime(dt_str: str) -> datetime:
+    """Parse various Breeze datetime formats."""
+    if not dt_str:
+        return datetime.now()
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%d-%b-%Y %H:%M:%S",
+        "%Y-%m-%d",
+        "%d-%b-%Y",
+    ]:
+        try:
+            return datetime.strptime(dt_str.strip(), fmt)
+        except ValueError:
+            continue
+    return datetime.now()
