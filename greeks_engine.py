@@ -1,220 +1,161 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: greeks_engine.py
+# ═══════════════════════════════════════════════════════════════
 """
-greeks_engine.py — Local Black-Scholes Greeks calculator with Newton-Raphson IV solver.
-No external API calls for Greeks computation.
+Self-contained Black-Scholes engine.
+Computes Delta, Gamma, Theta, Vega, and solves for Implied Volatility.
+All math is local — zero external API calls.
 """
-
-from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-
-import numpy as np
 from scipy.stats import norm
+from models import Greeks, OptionRight
+from config import Config
+from utils import LOG
 
 
-@dataclass
-class Greeks:
-    price: float  # theoretical BS price
-    iv: float
-    delta: float
-    gamma: float
-    theta: float
-    vega: float
+_SQRT_2PI = math.sqrt(2.0 * math.pi)
+_TRADING_DAYS = 365.0  # calendar days for Indian markets (convention)
 
 
 class BlackScholes:
-    """Optimised Black-Scholes engine for European options on indices."""
+    """Vectorisable Black-Scholes calculator."""
 
     @staticmethod
-    def d1(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    def _d1d2(
+        S: float, K: float, T: float, r: float, sigma: float
+    ) -> tuple[float, float]:
         if T <= 0 or sigma <= 0:
-            return 0.0
-        return (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            return 0.0, 0.0
+        sqrt_T = math.sqrt(T)
+        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+        d2 = d1 - sigma * sqrt_T
+        return d1, d2
 
-    @staticmethod
-    def d2(S: float, K: float, T: float, r: float, sigma: float) -> float:
-        if T <= 0 or sigma <= 0:
-            return 0.0
-        return BlackScholes.d1(S, K, T, r, sigma) - sigma * math.sqrt(T)
-
-    @staticmethod
-    def call_price(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    @classmethod
+    def price(
+        cls,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        right: OptionRight,
+    ) -> float:
         if T <= 0:
-            return max(S - K, 0.0)
-        d_1 = BlackScholes.d1(S, K, T, r, sigma)
-        d_2 = BlackScholes.d2(S, K, T, r, sigma)
-        return S * norm.cdf(d_1) - K * math.exp(-r * T) * norm.cdf(d_2)
-
-    @staticmethod
-    def put_price(S: float, K: float, T: float, r: float, sigma: float) -> float:
-        if T <= 0:
+            if right == OptionRight.CALL:
+                return max(S - K, 0.0)
             return max(K - S, 0.0)
-        d_1 = BlackScholes.d1(S, K, T, r, sigma)
-        d_2 = BlackScholes.d2(S, K, T, r, sigma)
-        return K * math.exp(-r * T) * norm.cdf(-d_2) - S * norm.cdf(-d_1)
+        d1, d2 = cls._d1d2(S, K, T, r, sigma)
+        if right == OptionRight.CALL:
+            return S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+        return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
-    @staticmethod
-    def delta(S: float, K: float, T: float, r: float, sigma: float,
-              right: str) -> float:
+    @classmethod
+    def delta(cls, S, K, T, r, sigma, right: OptionRight) -> float:
         if T <= 0 or sigma <= 0:
-            if right == "call":
+            if right == OptionRight.CALL:
                 return 1.0 if S > K else 0.0
             return -1.0 if S < K else 0.0
-        d_1 = BlackScholes.d1(S, K, T, r, sigma)
-        if right == "call":
-            return norm.cdf(d_1)
-        return norm.cdf(d_1) - 1.0
+        d1, _ = cls._d1d2(S, K, T, r, sigma)
+        if right == OptionRight.CALL:
+            return norm.cdf(d1)
+        return norm.cdf(d1) - 1.0
 
-    @staticmethod
-    def gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
-        if T <= 0 or sigma <= 0 or S <= 0:
-            return 0.0
-        d_1 = BlackScholes.d1(S, K, T, r, sigma)
-        return norm.pdf(d_1) / (S * sigma * math.sqrt(T))
-
-    @staticmethod
-    def theta(S: float, K: float, T: float, r: float, sigma: float,
-              right: str) -> float:
-        """Returns theta per calendar day (divide annual by 365)."""
+    @classmethod
+    def gamma(cls, S, K, T, r, sigma) -> float:
         if T <= 0 or sigma <= 0:
             return 0.0
-        d_1 = BlackScholes.d1(S, K, T, r, sigma)
-        d_2 = BlackScholes.d2(S, K, T, r, sigma)
-        sqrt_T = math.sqrt(T)
-        term1 = -(S * norm.pdf(d_1) * sigma) / (2 * sqrt_T)
-        if right == "call":
-            term2 = -r * K * math.exp(-r * T) * norm.cdf(d_2)
-        else:
-            term2 = r * K * math.exp(-r * T) * norm.cdf(-d_2)
-        return (term1 + term2) / 365.0
+        d1, _ = cls._d1d2(S, K, T, r, sigma)
+        return norm.pdf(d1) / (S * sigma * math.sqrt(T))
 
-    @staticmethod
-    def vega(S: float, K: float, T: float, r: float, sigma: float) -> float:
-        """Returns vega for a 1% (0.01) change in IV."""
+    @classmethod
+    def theta(cls, S, K, T, r, sigma, right: OptionRight) -> float:
         if T <= 0 or sigma <= 0:
             return 0.0
-        d_1 = BlackScholes.d1(S, K, T, r, sigma)
-        return S * norm.pdf(d_1) * math.sqrt(T) * 0.01
+        d1, d2 = cls._d1d2(S, K, T, r, sigma)
+        common = -(S * norm.pdf(d1) * sigma) / (2.0 * math.sqrt(T))
+        if right == OptionRight.CALL:
+            return (common - r * K * math.exp(-r * T) * norm.cdf(d2)) / _TRADING_DAYS
+        return (common + r * K * math.exp(-r * T) * norm.cdf(-d2)) / _TRADING_DAYS
 
-    @staticmethod
-    def implied_volatility(market_price: float, S: float, K: float, T: float,
-                           r: float, right: str,
-                           tol: float = 1e-6, max_iter: int = 100) -> float:
-        """Newton-Raphson IV solver."""
-        if T <= 0 or market_price <= 0:
+    @classmethod
+    def vega(cls, S, K, T, r, sigma) -> float:
+        if T <= 0 or sigma <= 0:
             return 0.0
+        d1, _ = cls._d1d2(S, K, T, r, sigma)
+        return S * norm.pdf(d1) * math.sqrt(T) / 100.0  # per 1% move
 
-        intrinsic = max(S - K, 0.0) if right == "call" else max(K - S, 0.0)
-        if market_price < intrinsic:
-            return 0.001
-
-        sigma = 0.25  # initial guess
-
-        for _ in range(max_iter):
-            if right == "call":
-                price = BlackScholes.call_price(S, K, T, r, sigma)
-            else:
-                price = BlackScholes.put_price(S, K, T, r, sigma)
-
-            d_1 = BlackScholes.d1(S, K, T, r, sigma)
-            vega_val = S * norm.pdf(d_1) * math.sqrt(T)
-
-            if vega_val < 1e-12:
-                break
-
-            diff = price - market_price
-            sigma -= diff / vega_val
-
-            if sigma <= 0.001:
-                sigma = 0.001
-            if sigma > 5.0:
-                sigma = 5.0
-
-            if abs(diff) < tol:
-                break
-
-        return sigma
-
-    @staticmethod
-    def compute_greeks(S: float, K: float, T: float, r: float,
-                       market_price: float, right: str) -> Greeks:
-        """Full Greeks computation: solves IV then computes all sensitivities."""
-        iv = BlackScholes.implied_volatility(market_price, S, K, T, r, right)
-
-        if right == "call":
-            theo_price = BlackScholes.call_price(S, K, T, r, iv)
-        else:
-            theo_price = BlackScholes.put_price(S, K, T, r, iv)
-
+    @classmethod
+    def greeks(cls, S, K, T, r, sigma, right: OptionRight) -> Greeks:
         return Greeks(
-            price=theo_price,
-            iv=iv,
-            delta=BlackScholes.delta(S, K, T, r, iv, right),
-            gamma=BlackScholes.gamma(S, K, T, r, iv),
-            theta=BlackScholes.theta(S, K, T, r, iv, right),
-            vega=BlackScholes.vega(S, K, T, r, iv),
+            delta=cls.delta(S, K, T, r, sigma, right),
+            gamma=cls.gamma(S, K, T, r, sigma),
+            theta=cls.theta(S, K, T, r, sigma, right),
+            vega=cls.vega(S, K, T, r, sigma),
+            iv=sigma,
         )
 
+    @classmethod
+    def implied_vol(
+        cls,
+        market_price: float,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        right: OptionRight,
+        initial_guess: float = 0.20,
+        tol: float = 1e-6,
+        max_iter: int = 100,
+    ) -> float:
+        """Newton-Raphson IV solver with Brent fallback."""
+        if market_price <= 0 or T <= 0:
+            return initial_guess
 
-class GreeksEngine:
-    """
-    Convenience wrapper that computes Greeks for an entire option chain
-    given the spot price and risk-free rate.
-    """
+        sigma = initial_guess
+        for _ in range(max_iter):
+            bs_price = cls.price(S, K, T, r, sigma, right)
+            diff = bs_price - market_price
+            v = cls.vega(S, K, T, r, sigma) * 100.0  # undo the /100
+            if abs(diff) < tol:
+                return max(sigma, 0.001)
+            if abs(v) < 1e-12:
+                break
+            sigma -= diff / v
+            sigma = max(sigma, 0.001)
+            sigma = min(sigma, 5.0)
 
-    def __init__(self, risk_free_rate: float = 0.07):
-        self.r = risk_free_rate
-        self.bs = BlackScholes
-
-    def compute_for_strike(self, spot: float, strike: float,
-                           tte_years: float, market_price: float,
-                           right: str) -> Greeks:
-        return self.bs.compute_greeks(spot, strike, tte_years, self.r,
-                                      market_price, right)
-
-    def find_strike_by_delta(self, spot: float, strikes: list[float],
-                             tte_years: float, prices: dict[float, float],
-                             target_delta: float, right: str) -> float:
-        """
-        Find the strike whose absolute delta is closest to target_delta.
-        `prices` maps strike -> LTP for the given right.
-        """
-        best_strike = strikes[0]
-        best_diff = float("inf")
-
-        for strike in strikes:
-            mkt_price = prices.get(strike, 0.0)
-            if mkt_price <= 0:
-                continue
-            greeks = self.compute_for_strike(spot, strike, tte_years,
-                                             mkt_price, right)
-            diff = abs(abs(greeks.delta) - target_delta)
-            if diff < best_diff:
-                best_diff = diff
-                best_strike = strike
-
-        return best_strike
-
-    @staticmethod
-    def time_to_expiry_years(expiry_date_str: str) -> float:
-        """
-        Calculate time to expiry in years from an ISO date string.
-        Minimum returned is 1 minute expressed in years.
-        """
-        from datetime import datetime, timezone
+        # Brent fallback between 1% and 500% vol
         try:
-            if "T" in expiry_date_str:
-                expiry = datetime.fromisoformat(
-                    expiry_date_str.replace("Z", "+00:00")
-                )
-            else:
-                expiry = datetime.strptime(expiry_date_str, "%Y-%m-%d")
-                expiry = expiry.replace(
-                    hour=15, minute=30,
-                    tzinfo=timezone.utc
-                )
-            now = datetime.now(timezone.utc)
-            diff = (expiry - now).total_seconds()
-            return max(diff / (365.25 * 24 * 3600), 1 / (365.25 * 24 * 60))
+            from scipy.optimize import brentq
+
+            def objective(s):
+                return cls.price(S, K, T, r, s, right) - market_price
+
+            sigma = brentq(objective, 0.01, 5.0, xtol=tol)
         except Exception:
-            return 1 / 365.25  # default 1 day
+            sigma = initial_guess
+        return max(sigma, 0.001)
+
+
+def compute_time_to_expiry(expiry_date_str: str) -> float:
+    """Return T in years from now to expiry (calendar-day basis)."""
+    from datetime import datetime
+
+    try:
+        # Try ISO format first: "2024-01-25T06:00:00.000Z"
+        expiry = datetime.strptime(expiry_date_str[:10], "%Y-%m-%d")
+    except ValueError:
+        try:
+            # Try "25-Jan-2024"
+            expiry = datetime.strptime(expiry_date_str[:11].strip(), "%d-%b-%Y")
+        except ValueError:
+            LOG.warning(f"Cannot parse expiry date: {expiry_date_str}")
+            return 1.0 / _TRADING_DAYS  # default 1 day
+
+    now = datetime.now()
+    diff = (expiry - now).total_seconds()
+    if diff <= 0:
+        return 0.0001  # avoid zero
+    return diff / (365.25 * 24 * 3600)
