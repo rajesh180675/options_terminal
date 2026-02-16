@@ -1,254 +1,203 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: trading_engine.py
+# ═══════════════════════════════════════════════════════════════
 """
-trading_engine.py — Main orchestrator that wires all components together.
-Manages background threads, crash recovery, and the overall lifecycle.
+Central orchestrator.
+  Boot → recover → monitor loop → graceful shutdown.
 """
 
-from __future__ import annotations
-
-import threading
 import time
-from datetime import datetime, timedelta, timezone
+import threading
+from typing import Optional, List
 
-from config import CFG, INSTRUMENTS
-from connection_manager import ConnectionManager
-from database import TradingDB
-from execution_engine import ExecutionEngine
-from greeks_engine import GreeksEngine
+from config import Config
+from models import Strategy, StrategyStatus, LegStatus
+from database import Database
+from shared_state import SharedState
+from connection_manager import SessionManager
+from order_manager import OrderManager
+from strategy_engine import StrategyEngine
 from rms import RiskManager
-from shared_state import SharedState, GreeksData
-from strategy_engine import StrategyEngine, StrategyParams
+from utils import LOG, breeze_date, next_weekly_expiry
 
 
 class TradingEngine:
     """
-    Top-level engine.  Initialised once in Streamlit's session_state.
+    The main engine that ties session, orders, strategies, and risk together.
+    Runs its monitor loop in a daemon thread so Streamlit can read SharedState
+    without blocking.
     """
 
     def __init__(self):
         self.state = SharedState()
-        self.db = TradingDB(CFG.db_path)
-        self.conn = ConnectionManager(self.state, mode=CFG.trading_mode)
-        self.executor = ExecutionEngine(self.conn, self.db, self.state)
+        self.db = Database()
+        self.session = SessionManager(self.state)
+        self.order_mgr = OrderManager(self.session, self.db, self.state)
         self.strategy_engine = StrategyEngine(
-            self.conn, self.db, self.state, self.executor
+            self.session, self.order_mgr, self.db, self.state
         )
-        self.rms = RiskManager(
-            self.db, self.state, self.executor, self.strategy_engine
+        self.risk_mgr = RiskManager(
+            self.session, self.order_mgr, self.db, self.state
         )
-        self.greeks_engine = GreeksEngine(CFG.risk_free_rate)
 
-        self._greeks_thread: threading.Thread | None = None
-        self._greeks_stop = threading.Event()
-        self._started = False
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._running = False
+        self._strategies: List[Strategy] = []
 
-    # --------------------------------------------------------- lifecycle
+    # ── Lifecycle ────────────────────────────────────────────
+
     def start(self) -> bool:
-        """Authenticate, connect WS, recover state, start monitors."""
-        if self._started:
-            return True
+        """Boot sequence: connect → recover → launch monitor."""
+        self.state.add_log("INFO", "Engine", "Starting trading engine…")
 
-        self.state.add_log("INFO", "Engine", "=== Trading Engine Starting ===")
-        self.state.add_log("INFO", "Engine", f"Mode: {CFG.trading_mode}")
-
-        # 1. Authenticate
-        if not self.conn.authenticate():
-            self.state.add_log("ERROR", "Engine", "Authentication failed")
+        # 1. Connect to Breeze
+        if not self.session.initialize():
+            self.state.add_log("ERROR", "Engine", "Breeze session failed")
             return False
 
-        # 2. Start WebSocket
-        self.conn.start_websocket()
-        time.sleep(1)
+        # 2. Connect WebSocket
+        self.session.connect_websocket()
+        time.sleep(1.0)
 
-        # 3. Recover state from DB
-        self._recover_state()
+        # 3. Recover orphaned positions
+        self._recover_positions()
 
-        # 4. Start Greeks updater
-        self._greeks_stop.clear()
-        self._greeks_thread = threading.Thread(
-            target=self._greeks_update_loop,
-            daemon=True,
-            name="Greeks-Updater",
+        # 4. Launch monitor loop
+        self._running = True
+        self.state.engine_running = True
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, daemon=True, name="EngineMonitor"
         )
-        self._greeks_thread.start()
-
-        # 5. Start RMS
-        self.rms.start()
-
-        self._started = True
-        self.state.set_engine_running(True)
-        self.state.add_log("INFO", "Engine",
-                           "=== Trading Engine Running ===")
+        self._monitor_thread.start()
+        self.state.add_log("INFO", "Engine", "Engine running ✓")
+        LOG.info("Trading engine started")
         return True
 
     def stop(self):
         """Graceful shutdown."""
-        self.state.add_log("INFO", "Engine", "=== Shutting Down ===")
-        self.state.set_engine_running(False)
-        self.rms.stop()
-        self._greeks_stop.set()
-        self.conn.stop_websocket()
-        self._started = False
-        self.state.add_log("INFO", "Engine", "=== Shutdown Complete ===")
+        self._running = False
+        self.state.engine_running = False
+        self.session.shutdown()
+        self.db.close()
+        self.state.add_log("INFO", "Engine", "Engine stopped")
+        LOG.info("Trading engine stopped")
 
-    # -------------------------------------------------- crash recovery
-    def _recover_state(self):
-        """
-        On restart, reload active strategies and positions from DB.
-        Re-subscribe to WebSocket feeds for monitored strikes.
-        """
-        self.state.add_log("INFO", "Engine", "Recovering state from DB...")
+    # ── Recovery ─────────────────────────────────────────────
 
-        active = self.db.get_active_strategies()
-        if not active:
-            self.state.add_log("INFO", "Engine", "No active strategies to recover")
+    def _recover_positions(self):
+        """
+        On startup, reload active strategies/legs from the DB.
+        Re-subscribe their feeds so tick data flows again.
+        """
+        strategies = self.db.get_active_strategies()
+        if not strategies:
+            self.state.add_log("INFO", "Engine", "No positions to recover")
             return
 
-        for strat in active:
-            sid = strat["id"]
-            self.state.set_strategy(sid, strat)
-            self.state.add_log(
-                "INFO", "Engine",
-                f"Recovered strategy {sid}: {strat['name']} "
-                f"CE={strat['ce_strike']} PE={strat['pe_strike']} "
-                f"Status={strat['status']}",
-            )
+        self.state.add_log("INFO", "Engine",
+                           f"Recovering {len(strategies)} active strategies")
+        LOG.info(f"Recovering {len(strategies)} strategies from DB")
 
-            # Re-subscribe to feeds
-            stock_code = strat["stock_code"]
-            expiry = strat["expiry_date"]
-            if strat["ce_strike"]:
-                self.conn.subscribe(stock_code, expiry,
-                                    strat["ce_strike"], "call")
-            if strat["pe_strike"]:
-                self.conn.subscribe(stock_code, expiry,
-                                    strat["pe_strike"], "put")
+        for strategy in strategies:
+            for leg in strategy.legs:
+                if leg.status in (LegStatus.ACTIVE, LegStatus.ENTERING):
+                    try:
+                        self.session.subscribe_option(
+                            leg.stock_code, leg.strike_price,
+                            leg.right.value, leg.expiry_date
+                        )
+                        self.state.add_log("INFO", "Engine",
+                                           f"Re-subscribed: {leg.stock_code} "
+                                           f"{leg.strike_price}{leg.right.value[0].upper()}")
+                    except Exception as e:
+                        LOG.error(f"Re-subscribe failed for {leg.leg_id}: {e}")
 
-        positions = self.db.get_open_positions()
-        for pos in positions:
-            self.state.set_position(pos["id"], pos)
+        self._strategies = strategies
+        self.state.set_strategies(strategies)
 
-        self.state.add_log(
-            "INFO", "Engine",
-            f"Recovered {len(active)} strategies, "
-            f"{len(positions)} open positions",
-        )
+    # ── Monitor loop ─────────────────────────────────────────
 
-    # ------------------------------------------------ greeks updater
-    def _greeks_update_loop(self):
-        """Periodically re-compute Greeks for all open positions."""
-        while not self._greeks_stop.is_set():
+    def _monitor_loop(self):
+        """
+        Core loop running at ~2 Hz:
+          1. Update prices from tick data
+          2. Recompute Greeks
+          3. Check per-leg stop-losses
+          4. Check global MTM
+          5. Push updated state
+        """
+        while self._running:
             try:
-                positions = self.db.get_open_positions()
-                for pos in positions:
-                    stock_code = pos["stock_code"]
-                    strike = pos["strike_price"]
-                    right = pos["right_type"]
-                    expiry = pos["expiry_date"]
+                # Reload strategies from DB (picks up any newly deployed ones)
+                self._strategies = self.db.get_active_strategies()
 
-                    spot = self.state.get_spot(stock_code)
-                    if spot <= 0:
-                        continue
+                # Get spot price
+                stock_code = Config.DEFAULT_STOCK
+                spot = self.session.get_spot_price(stock_code)
+                if spot > 0:
+                    self.state.set_spot(stock_code, spot)
 
-                    ltp = self.state.get_ltp(stock_code, strike, right)
-                    if ltp <= 0:
-                        continue
+                # Update leg prices from ticks
+                for strategy in self._strategies:
+                    for leg in strategy.legs:
+                        if leg.status != LegStatus.ACTIVE:
+                            continue
+                        tick = self.state.get_tick(leg.feed_key)
+                        if tick and tick.ltp > 0:
+                            leg.current_price = tick.ltp
+                            leg.compute_pnl()
+                            self.db.update_leg_price(leg.leg_id, leg.current_price, leg.pnl)
 
-                    tte = GreeksEngine.time_to_expiry_years(expiry)
-                    greeks = self.greeks_engine.compute_for_strike(
-                        spot, strike, tte, ltp, right
-                    )
+                # Update Greeks
+                if spot > 0:
+                    self.risk_mgr.update_greeks(self._strategies, spot)
 
-                    gd = GreeksData(
-                        iv=greeks.iv,
-                        delta=greeks.delta,
-                        gamma=greeks.gamma,
-                        theta=greeks.theta,
-                        vega=greeks.vega,
-                    )
-                    self.state.update_greeks(stock_code, strike, right, gd)
+                # Check stop-losses
+                if not self.state.panic_triggered:
+                    self.risk_mgr.check_stop_losses(self._strategies)
+
+                # Check global MTM
+                if not self.state.panic_triggered:
+                    self.risk_mgr.check_global_mtm(self._strategies)
+
+                # Compute and push total MTM
+                total_mtm = sum(
+                    s.compute_total_pnl() for s in self._strategies
+                    if s.status in (StrategyStatus.ACTIVE, StrategyStatus.PARTIAL_EXIT)
+                )
+                self.state.set_total_mtm(total_mtm)
+                self.state.set_strategies(self._strategies)
 
             except Exception as e:
-                self.state.add_log("ERROR", "Greeks",
-                                   f"Greeks update error: {e}")
+                LOG.exception(f"Monitor loop error: {e}")
+                self.state.add_log("ERROR", "Engine", f"Monitor error: {e}")
 
-            self._greeks_stop.wait(2.0)
+            time.sleep(Config.MONITOR_INTERVAL)
 
-    # ------------------------------------------- public API for UI
-    def deploy_strategy(self, params: StrategyParams) -> str | None:
-        """Called from UI thread. Runs execution in background."""
-        result = [None]
+    # ── Public interface for Streamlit ───────────────────────
 
-        def _run():
-            result[0] = self.strategy_engine.deploy_strategy(params)
+    def deploy_straddle(self, stock_code: str, expiry: str,
+                        lots: int, sl_pct: float) -> Optional[Strategy]:
+        return self.strategy_engine.deploy_short_straddle(
+            stock_code=stock_code,
+            expiry_date=expiry,
+            lots=lots,
+            sl_percentage=sl_pct,
+        )
 
-        t = threading.Thread(target=_run, daemon=True, name="Deploy")
-        t.start()
-        t.join(timeout=120)
-        return result[0]
+    def deploy_strangle(self, stock_code: str, target_delta: float,
+                        expiry: str, lots: int, sl_pct: float) -> Optional[Strategy]:
+        return self.strategy_engine.deploy_short_strangle(
+            stock_code=stock_code,
+            target_delta=target_delta,
+            expiry_date=expiry,
+            lots=lots,
+            sl_percentage=sl_pct,
+        )
 
-    def exit_strategy(self, sid: str, use_market: bool = False):
-        """Called from UI thread."""
-        def _run():
-            self.strategy_engine.exit_strategy(sid, use_market)
+    def trigger_panic_exit(self):
+        strategies = self.db.get_active_strategies()
+        self.risk_mgr.panic_exit(strategies)
 
-        t = threading.Thread(target=_run, daemon=True, name="Exit")
-        t.start()
-
-    def panic_exit(self):
-        """Trigger global kill switch."""
-        self.rms.panic_exit()
-
-    def get_expiry_dates(self, instrument: str = "NIFTY") -> list[str]:
-        """Generate upcoming weekly expiry dates (Thursday IST)."""
-        today = datetime.now(timezone.utc).date()
-        expiries = []
-        for i in range(8):
-            d = today + timedelta(days=i)
-            # Find next Thursday (weekday 3)
-            days_ahead = (3 - d.weekday()) % 7
-            if days_ahead == 0 and d == today:
-                expiry = d
-            else:
-                expiry = d + timedelta(days=days_ahead)
-                if expiry in [e.date() if hasattr(e, 'date') else e
-                              for e in expiries]:
-                    continue
-            expiry_iso = (
-                datetime(expiry.year, expiry.month, expiry.day,
-                         15, 30, 0, tzinfo=timezone.utc)
-                .strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            )
-            if expiry_iso not in expiries:
-                expiries.append(expiry_iso)
-
-        return sorted(set(expiries))[:5]
-
-    def refresh_option_chain(self, instrument: str,
-                             expiry_date: str) -> list[dict]:
-        """Fetch and cache option chain for display."""
-        spec = CFG.get_instrument(instrument)
-        chain = self.conn.get_option_chain(spec.stock_code, expiry_date)
-
-        # Update spot
-        spot = 0.0
-        for rec in chain:
-            sp = rec.get("spot_price", "")
-            if sp:
-                try:
-                    spot = float(sp)
-                    break
-                except ValueError:
-                    pass
-
-        if spot > 0:
-            self.state.set_spot(spec.stock_code, spot)
-        else:
-            spot = self.conn.get_spot_quote(spec.stock_code)
-            if spot > 0:
-                self.state.set_spot(spec.stock_code, spot)
-
-        return chain
-
-    @property
-    def is_running(self) -> bool:
-        return self._started
+    def get_chain_with_greeks(self, stock_code: str, expiry: str) -> list:
+        return self.strategy_engine.get_option_chain_with_greeks(stock_code, expiry)
