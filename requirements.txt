@@ -1,0 +1,7 @@
+breeze-connect>=1.0.50
+streamlit>=1.37.0
+scipy>=1.11.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+pyotp>=2.9.0
+pandas>=2.0.0
