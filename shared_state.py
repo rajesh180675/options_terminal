@@ -1,171 +1,81 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: shared_state.py
+# ═══════════════════════════════════════════════════════════════
 """
-shared_state.py — Thread-safe in-memory state container.
-All components read/write through this object.
+Thread-safe state bus shared between the engine thread and the Streamlit UI.
 """
-
-from __future__ import annotations
 
 import threading
-import time
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Dict, List, Optional
+from collections import deque
 
-
-@dataclass
-class TickData:
-    symbol: str = ""
-    stock_code: str = ""
-    strike_price: float = 0.0
-    right: str = ""
-    expiry_date: str = ""
-    ltp: float = 0.0
-    bid: float = 0.0
-    ask: float = 0.0
-    open: float = 0.0
-    high: float = 0.0
-    low: float = 0.0
-    close: float = 0.0
-    volume: int = 0
-    oi: int = 0
-    timestamp: float = 0.0
-
-
-@dataclass
-class GreeksData:
-    iv: float = 0.0
-    delta: float = 0.0
-    gamma: float = 0.0
-    theta: float = 0.0
-    vega: float = 0.0
-
-
-@dataclass
-class OptionStrike:
-    strike: float = 0.0
-    ce_tick: TickData = field(default_factory=TickData)
-    pe_tick: TickData = field(default_factory=TickData)
-    ce_greeks: GreeksData = field(default_factory=GreeksData)
-    pe_greeks: GreeksData = field(default_factory=GreeksData)
+from models import TickData, Strategy, LogEntry
 
 
 class SharedState:
-    """Central state object shared across all threads."""
+    """Every mutable field is guarded by a single reentrant lock."""
 
-    def __init__(self):
+    def __init__(self, max_logs: int = 500):
         self._lock = threading.RLock()
 
-        # Market data keyed by (stock_code, strike, right)
-        self._ticks: dict[tuple[str, float, str], TickData] = {}
+        # Market data: feed_key → TickData
+        self._ticks: Dict[str, TickData] = {}
 
-        # Greeks keyed by (stock_code, strike, right)
-        self._greeks: dict[tuple[str, float, str], GreeksData] = {}
+        # Active strategies
+        self._strategies: List[Strategy] = []
 
-        # Spot prices keyed by stock_code
-        self._spots: dict[str, float] = {}
+        # Spot prices
+        self._spot_prices: Dict[str, float] = {}
 
-        # Option chain (sorted strikes) keyed by stock_code
-        self._chains: dict[str, list[OptionStrike]] = {}
+        # Log ring buffer
+        self._logs: deque = deque(maxlen=max_logs)
 
-        # Active strategy states (quick access mirrors DB)
-        self._strategies: dict[str, dict] = {}
-
-        # Positions mirror
-        self._positions: dict[str, dict] = {}
+        # Flags
+        self._connected: bool = False
+        self._ws_connected: bool = False
+        self._engine_running: bool = False
+        self._kill_switch_armed: bool = False
+        self._panic_triggered: bool = False
 
         # Global P&L
         self._total_mtm: float = 0.0
 
-        # Connection status
-        self._ws_connected: bool = False
-        self._last_tick_time: float = 0.0
-        self._api_connected: bool = False
+    # ── Tick data ────────────────────────────────────────────
 
-        # Log buffer for UI (ring buffer)
-        self._log_buffer: list[dict] = []
-        self._log_max = 500
+    def update_tick(self, tick: TickData):
+        with self._lock:
+            self._ticks[tick.feed_key] = tick
 
-        # Kill switch
-        self._kill_switch_active: bool = False
+    def get_tick(self, feed_key: str) -> Optional[TickData]:
+        with self._lock:
+            return self._ticks.get(feed_key)
 
-        # Engine running flag
-        self._engine_running: bool = False
+    def get_all_ticks(self) -> Dict[str, TickData]:
+        with self._lock:
+            return dict(self._ticks)
 
-    # --------------------------------------------------------- spot price
+    # ── Spot prices ──────────────────────────────────────────
+
     def set_spot(self, stock_code: str, price: float):
         with self._lock:
-            self._spots[stock_code] = price
+            self._spot_prices[stock_code] = price
 
     def get_spot(self, stock_code: str) -> float:
         with self._lock:
-            return self._spots.get(stock_code, 0.0)
+            return self._spot_prices.get(stock_code, 0.0)
 
-    # ------------------------------------------------------- tick data
-    def update_tick(self, stock_code: str, strike: float, right: str, tick: TickData):
-        key = (stock_code, strike, right)
+    # ── Strategies ───────────────────────────────────────────
+
+    def set_strategies(self, strategies: List[Strategy]):
         with self._lock:
-            self._ticks[key] = tick
-            self._last_tick_time = time.time()
+            self._strategies = strategies
 
-    def get_tick(self, stock_code: str, strike: float, right: str) -> TickData | None:
+    def get_strategies(self) -> List[Strategy]:
         with self._lock:
-            return self._ticks.get((stock_code, strike, right))
+            return list(self._strategies)
 
-    def get_ltp(self, stock_code: str, strike: float, right: str) -> float:
-        tick = self.get_tick(stock_code, strike, right)
-        return tick.ltp if tick else 0.0
+    # ── P&L ──────────────────────────────────────────────────
 
-    # -------------------------------------------------------- greeks
-    def update_greeks(self, stock_code: str, strike: float, right: str,
-                      greeks: GreeksData):
-        with self._lock:
-            self._greeks[(stock_code, strike, right)] = greeks
-
-    def get_greeks(self, stock_code: str, strike: float, right: str) -> GreeksData:
-        with self._lock:
-            return self._greeks.get((stock_code, strike, right), GreeksData())
-
-    # ------------------------------------------------------ option chain
-    def set_chain(self, stock_code: str, chain: list[OptionStrike]):
-        with self._lock:
-            self._chains[stock_code] = chain
-
-    def get_chain(self, stock_code: str) -> list[OptionStrike]:
-        with self._lock:
-            return list(self._chains.get(stock_code, []))
-
-    # ------------------------------------------------------ strategies
-    def set_strategy(self, sid: str, data: dict):
-        with self._lock:
-            self._strategies[sid] = data
-
-    def get_strategy(self, sid: str) -> dict | None:
-        with self._lock:
-            return self._strategies.get(sid)
-
-    def get_all_strategies(self) -> dict[str, dict]:
-        with self._lock:
-            return dict(self._strategies)
-
-    def remove_strategy(self, sid: str):
-        with self._lock:
-            self._strategies.pop(sid, None)
-
-    # ------------------------------------------------------ positions
-    def set_position(self, pid: str, data: dict):
-        with self._lock:
-            self._positions[pid] = data
-
-    def get_open_positions(self) -> dict[str, dict]:
-        with self._lock:
-            return {k: v for k, v in self._positions.items()
-                    if v.get("status") == "open"}
-
-    def remove_position(self, pid: str):
-        with self._lock:
-            self._positions.pop(pid, None)
-
-    # -------------------------------------------------------- P&L
     def set_total_mtm(self, value: float):
         with self._lock:
             self._total_mtm = value
@@ -174,66 +84,55 @@ class SharedState:
         with self._lock:
             return self._total_mtm
 
-    # ------------------------------------------------- connection status
-    def set_ws_connected(self, val: bool):
-        with self._lock:
-            self._ws_connected = val
+    # ── Logging ──────────────────────────────────────────────
 
-    def is_ws_connected(self) -> bool:
+    def add_log(self, level: str, source: str, message: str, data=None):
+        entry = LogEntry(level=level, source=source, message=message, data=data)
+        with self._lock:
+            self._logs.append(entry)
+
+    def get_logs(self, n: int = 100) -> List[LogEntry]:
+        with self._lock:
+            return list(self._logs)[-n:]
+
+    # ── Flags ────────────────────────────────────────────────
+
+    @property
+    def connected(self) -> bool:
+        with self._lock:
+            return self._connected
+
+    @connected.setter
+    def connected(self, val: bool):
+        with self._lock:
+            self._connected = val
+
+    @property
+    def ws_connected(self) -> bool:
         with self._lock:
             return self._ws_connected
 
-    def get_last_tick_age(self) -> float:
+    @ws_connected.setter
+    def ws_connected(self, val: bool):
         with self._lock:
-            if self._last_tick_time == 0:
-                return 999.0
-            return time.time() - self._last_tick_time
+            self._ws_connected = val
 
-    def set_api_connected(self, val: bool):
-        with self._lock:
-            self._api_connected = val
-
-    def is_api_connected(self) -> bool:
-        with self._lock:
-            return self._api_connected
-
-    # ---------------------------------------------------- kill switch
-    def activate_kill_switch(self):
-        with self._lock:
-            self._kill_switch_active = True
-
-    def deactivate_kill_switch(self):
-        with self._lock:
-            self._kill_switch_active = False
-
-    def is_kill_switch_active(self) -> bool:
-        with self._lock:
-            return self._kill_switch_active
-
-    # ------------------------------------------------------- engine
-    def set_engine_running(self, val: bool):
-        with self._lock:
-            self._engine_running = val
-
-    def is_engine_running(self) -> bool:
+    @property
+    def engine_running(self) -> bool:
         with self._lock:
             return self._engine_running
 
-    # ----------------------------------------------------------- logs
-    def add_log(self, level: str, source: str, message: str,
-                data: Any = None):
-        entry = {
-            "ts": time.strftime("%H:%M:%S"),
-            "level": level,
-            "source": source,
-            "message": message,
-            "data": data,
-        }
+    @engine_running.setter
+    def engine_running(self, val: bool):
         with self._lock:
-            self._log_buffer.append(entry)
-            if len(self._log_buffer) > self._log_max:
-                self._log_buffer = self._log_buffer[-self._log_max:]
+            self._engine_running = val
 
-    def get_logs(self, n: int = 100) -> list[dict]:
+    @property
+    def panic_triggered(self) -> bool:
         with self._lock:
-            return list(self._log_buffer[-n:])
+            return self._panic_triggered
+
+    @panic_triggered.setter
+    def panic_triggered(self, val: bool):
+        with self._lock:
+            self._panic_triggered = val
