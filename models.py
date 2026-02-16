@@ -2,8 +2,7 @@
 # FILE: models.py
 # ═══════════════════════════════════════════════════════════════
 """
-All data containers and enums. Unchanged structurally but with
-corrected feed_key generation matching Breeze's actual format.
+Data containers with trailing SL support and canonical feed_key.
 """
 
 from __future__ import annotations
@@ -18,21 +17,9 @@ class OrderSide(str, Enum):
     BUY = "buy"
     SELL = "sell"
 
-
 class OrderType(str, Enum):
     LIMIT = "limit"
     MARKET = "market"
-
-
-class OrderStatus(str, Enum):
-    PENDING = "pending"
-    OPEN = "open"
-    FILLED = "filled"
-    PARTIALLY_FILLED = "partially_filled"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-    MODIFYING = "modifying"
-
 
 class LegStatus(str, Enum):
     PENDING = "pending"
@@ -43,17 +30,14 @@ class LegStatus(str, Enum):
     SQUARED_OFF = "squared_off"
     ERROR = "error"
 
-
 class OptionRight(str, Enum):
     CALL = "call"
     PUT = "put"
-
 
 class StrategyType(str, Enum):
     SHORT_STRADDLE = "short_straddle"
     SHORT_STRANGLE = "short_strangle"
     MANUAL_SELL = "manual_sell"
-
 
 class StrategyStatus(str, Enum):
     DEPLOYING = "deploying"
@@ -76,8 +60,8 @@ class Greeks:
 class TickData:
     stock_code: str = ""
     strike_price: float = 0.0
-    right: str = ""          # "call" or "put" — always lowercase
-    expiry_date: str = ""    # Breeze ISO format
+    right: str = ""
+    expiry_date: str = ""
     ltp: float = 0.0
     best_bid: float = 0.0
     best_ask: float = 0.0
@@ -87,25 +71,9 @@ class TickData:
 
     @property
     def feed_key(self) -> str:
-        """Canonical key: STOCK|STRIKE_INT|RIGHT|EXPIRY_DATE_10"""
-        r = self.right.lower().strip()
+        r = self.right.strip().lower()
         exp = self.expiry_date[:10] if self.expiry_date else ""
         return f"{self.stock_code}|{int(self.strike_price)}|{r}|{exp}"
-
-
-@dataclass
-class OptionQuote:
-    stock_code: str = ""
-    strike_price: float = 0.0
-    right: OptionRight = OptionRight.CALL
-    expiry_date: str = ""
-    ltp: float = 0.0
-    bid: float = 0.0
-    ask: float = 0.0
-    volume: int = 0
-    oi: int = 0
-    greeks: Greeks = field(default_factory=Greeks)
-    timestamp: datetime = field(default_factory=datetime.now)
 
 
 @dataclass
@@ -116,7 +84,7 @@ class Leg:
     exchange_code: str = "NFO"
     strike_price: float = 0.0
     right: OptionRight = OptionRight.CALL
-    expiry_date: str = ""     # Breeze ISO format
+    expiry_date: str = ""
     side: OrderSide = OrderSide.SELL
     quantity: int = 0
     entry_price: float = 0.0
@@ -124,6 +92,8 @@ class Leg:
     exit_price: float = 0.0
     sl_price: float = 0.0
     sl_percentage: float = 0.0
+    lowest_price: float = 0.0      # for trailing SL
+    trailing_active: bool = False   # trailing SL engaged?
     entry_order_id: str = ""
     exit_order_id: str = ""
     status: LegStatus = LegStatus.PENDING
@@ -148,6 +118,10 @@ class Leg:
         exp = self.expiry_date[:10] if self.expiry_date else ""
         return f"{self.stock_code}|{int(self.strike_price)}|{r}|{exp}"
 
+    @property
+    def display_name(self) -> str:
+        return f"{self.stock_code} {int(self.strike_price)} {self.right.value.upper()[:1]}E"
+
 
 @dataclass
 class Strategy:
@@ -164,6 +138,19 @@ class Strategy:
     def compute_total_pnl(self) -> float:
         self.total_pnl = sum(leg.compute_pnl() for leg in self.legs)
         return self.total_pnl
+
+    @property
+    def net_greeks(self) -> Greeks:
+        g = Greeks()
+        for leg in self.legs:
+            if leg.status != LegStatus.ACTIVE:
+                continue
+            sign = -1.0 if leg.side == OrderSide.SELL else 1.0
+            g.delta += leg.greeks.delta * sign * leg.quantity
+            g.gamma += leg.greeks.gamma * sign * leg.quantity
+            g.theta += leg.greeks.theta * sign * leg.quantity
+            g.vega += leg.greeks.vega * sign * leg.quantity
+        return g
 
 
 @dataclass
