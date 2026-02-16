@@ -1,23 +1,25 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: main.py  (Streamlit dashboard — entry point)
+# ═══════════════════════════════════════════════════════════════
 """
-main.py — Streamlit-based Options Trading Terminal.
-Run with:  streamlit run main.py
+streamlit run main.py
+
+Layout:
+  ┌──────────────────────────────────────────────────────┐
+  │  HEADER: Total MTM   │  Status indicators            │
+  ├──────────┬───────────┴──────────────────────────────┤
+  │ SIDEBAR  │  BODY                                     │
+  │ Config   │  Tab 1: Option Chain (CE / PE side-by-side)│
+  │ Deploy   │  Tab 2: Active Positions                   │
+  │ Controls │  Tab 3: Order & System Logs                │
+  └──────────┴───────────────────────────────────────────┘
 """
 
-from __future__ import annotations
-
-import time
-from datetime import datetime, timezone
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import time
+from datetime import datetime
 
-from config import CFG, INSTRUMENTS
-from strategy_engine import StrategyParams
-from trading_engine import TradingEngine
-
-# ================================================================
-# Page config
-# ================================================================
 st.set_page_config(
     page_title="Options Terminal",
     page_icon="📊",
@@ -25,470 +27,350 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ================================================================
-# Custom CSS
-# ================================================================
-st.markdown("""
-<style>
-    .stMetric { border: 1px solid #333; border-radius: 8px; padding: 10px; }
-    .profit { background-color: #0d4d0d !important; border-radius: 8px; padding: 15px; }
-    .loss { background-color: #4d0d0d !important; border-radius: 8px; padding: 15px; }
-    div[data-testid="stMetric"] label { font-size: 0.9rem !important; }
-    div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
-        font-size: 1.5rem !important; font-weight: bold;
-    }
-    .log-entry { font-family: monospace; font-size: 0.75rem; line-height: 1.3; }
-    .log-error { color: #ff4444; }
-    .log-warn { color: #ffaa00; }
-    .log-info { color: #aaaaaa; }
-    .log-critical { color: #ff0000; font-weight: bold; }
-    .kill-btn button { background-color: #ff0000 !important; color: white !important;
-                       font-weight: bold !important; font-size: 1.2rem !important; }
-</style>
-""", unsafe_allow_html=True)
+# ── Auto-refresh (1 second) ─────────────────────────────────
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=1000, limit=None, key="terminal_refresh")
+except ImportError:
+    pass  # Will need manual refresh without the package
+
+from trading_engine import TradingEngine
+from config import Config
+from utils import breeze_date, next_weekly_expiry
+from models import LegStatus, StrategyStatus
 
 
-# ================================================================
-# Engine initialisation (once per session)
-# ================================================================
+# ═══════════════════════════════════════════════════════════════
+# ENGINE SINGLETON (initialised once per Streamlit session)
+# ═══════════════════════════════════════════════════════════════
+
 def get_engine() -> TradingEngine:
     if "engine" not in st.session_state:
-        st.session_state.engine = TradingEngine()
+        engine = TradingEngine()
+        success = engine.start()
+        st.session_state.engine = engine
+        st.session_state.engine_started = success
     return st.session_state.engine
 
 
 engine = get_engine()
+state = engine.state
 
 
-# ================================================================
-# Sidebar — Connection & Strategy Controls
-# ================================================================
-with st.sidebar:
-    st.title("⚙️ Control Panel")
+# ═══════════════════════════════════════════════════════════════
+# CUSTOM CSS
+# ═══════════════════════════════════════════════════════════════
 
-    # --- Connection ---
-    st.subheader("Connection")
-    col_status, col_btn = st.columns([2, 1])
-    with col_status:
-        if engine.is_running:
-            st.success("🟢 Connected")
-        else:
-            st.error("🔴 Disconnected")
-    with col_btn:
-        if not engine.is_running:
-            if st.button("Connect", use_container_width=True):
-                with st.spinner("Connecting..."):
-                    ok = engine.start()
-                if ok:
-                    st.rerun()
-                else:
-                    st.error("Connection failed. Check logs.")
-        else:
-            if st.button("Disconnect", use_container_width=True):
-                engine.stop()
-                st.rerun()
-
-    st.divider()
-
-    # --- Strategy Deployment ---
-    st.subheader("Deploy Strategy")
-
-    instrument = st.selectbox("Instrument",
-                              list(INSTRUMENTS.keys()),
-                              index=0)
-
-    strategy_type = st.selectbox("Strategy",
-                                 ["strangle", "straddle"],
-                                 index=0)
-
-    target_delta = st.slider("Target Delta",
-                             min_value=0.05, max_value=0.40,
-                             value=0.15, step=0.01,
-                             help="Absolute delta for OTM strike selection",
-                             disabled=(strategy_type == "straddle"))
-
-    lots = st.number_input("Lots", min_value=1, max_value=50, value=1)
-
-    sl_mult = st.number_input("SL Multiplier",
-                              min_value=1.0, max_value=5.0,
-                              value=CFG.default_sl_multiplier,
-                              step=0.1)
-
-    expiry_dates = engine.get_expiry_dates(instrument) if engine.is_running else []
-    expiry = st.selectbox("Expiry Date",
-                          expiry_dates if expiry_dates else ["Connect first"],
-                          index=0)
-
-    if st.button("🚀 Deploy Strategy",
-                 use_container_width=True,
-                 disabled=not engine.is_running or expiry == "Connect first",
-                 type="primary"):
-        params = StrategyParams(
-            instrument=instrument,
-            strategy_type=strategy_type,
-            target_delta=target_delta,
-            lots=lots,
-            sl_multiplier=sl_mult,
-            expiry_date=expiry,
-        )
-        with st.spinner("Deploying..."):
-            sid = engine.deploy_strategy(params)
-        if sid:
-            st.success(f"Strategy {sid} deployed!")
-        else:
-            st.error("Deployment failed. Check logs.")
-        st.rerun()
-
-    st.divider()
-
-    # --- Kill Switch ---
-    st.subheader("Emergency")
-    kill_col = st.container()
-    with kill_col:
-        st.markdown('<div class="kill-btn">', unsafe_allow_html=True)
-        if st.button("🚨 PANIC EXIT — CLOSE ALL",
-                     use_container_width=True,
-                     disabled=not engine.is_running):
-            engine.panic_exit()
-            st.warning("Kill switch activated!")
-            time.sleep(2)
-            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+st.markdown("""
+<style>
+    .stApp { background-color: #0e1117; }
+    .pnl-positive {
+        background-color: #0d4d2b; color: #00ff88;
+        padding: 12px 20px; border-radius: 8px;
+        font-size: 28px; font-weight: bold; text-align: center;
+    }
+    .pnl-negative {
+        background-color: #4d0d0d; color: #ff4444;
+        padding: 12px 20px; border-radius: 8px;
+        font-size: 28px; font-weight: bold; text-align: center;
+    }
+    .status-badge {
+        padding: 4px 12px; border-radius: 12px;
+        font-size: 13px; font-weight: 600;
+        display: inline-block; margin: 2px;
+    }
+    .badge-green { background-color: #0d4d2b; color: #00ff88; }
+    .badge-red { background-color: #4d0d0d; color: #ff4444; }
+    .badge-yellow { background-color: #4d4d0d; color: #ffff44; }
+    .log-container {
+        font-family: 'Courier New', monospace;
+        font-size: 12px; background: #1a1a2e;
+        padding: 10px; border-radius: 6px;
+        max-height: 400px; overflow-y: auto;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
-# ================================================================
-# Main Dashboard
-# ================================================================
+# ═══════════════════════════════════════════════════════════════
+# HEADER
+# ═══════════════════════════════════════════════════════════════
 
-# --- Header: P&L ---
-st.title("📊 Options Trading Terminal")
+total_mtm = state.get_total_mtm()
+pnl_class = "pnl-positive" if total_mtm >= 0 else "pnl-negative"
+pnl_sign = "+" if total_mtm >= 0 else ""
 
+col_h1, col_h2, col_h3, col_h4 = st.columns([3, 1, 1, 1])
 
-@st.fragment(run_every=1)
-def render_pnl_header():
-    """Real-time P&L display — updates every second."""
-    mtm = engine.state.get_total_mtm()
-    ws_ok = engine.state.is_ws_connected()
-    tick_age = engine.state.get_last_tick_age()
+with col_h1:
+    st.markdown(
+        f'<div class="{pnl_class}">Total MTM: ₹{pnl_sign}{total_mtm:,.2f}</div>',
+        unsafe_allow_html=True,
+    )
 
-    cols = st.columns([2, 1, 1, 1])
-    with cols[0]:
-        color = "normal" if mtm >= 0 else "inverse"
-        st.metric("Total MTM P&L", f"₹{mtm:,.2f}",
-                  delta=f"{'🟢' if mtm >= 0 else '🔴'}")
-    with cols[1]:
-        st.metric("Mode", CFG.trading_mode.upper())
-    with cols[2]:
-        st.metric("WebSocket", "🟢 Live" if ws_ok else "🔴 Down")
-    with cols[3]:
-        st.metric("Tick Age", f"{tick_age:.0f}s")
+with col_h2:
+    conn_color = "badge-green" if state.connected else "badge-red"
+    conn_text = "API ✓" if state.connected else "API ✗"
+    st.markdown(f'<span class="status-badge {conn_color}">{conn_text}</span>',
+                unsafe_allow_html=True)
 
+with col_h3:
+    ws_color = "badge-green" if state.ws_connected else "badge-red"
+    ws_text = "WS ✓" if state.ws_connected else "WS ✗"
+    st.markdown(f'<span class="status-badge {ws_color}">{ws_text}</span>',
+                unsafe_allow_html=True)
 
-render_pnl_header()
+with col_h4:
+    spot = state.get_spot(Config.DEFAULT_STOCK)
+    st.markdown(
+        f'<span class="status-badge badge-yellow">'
+        f'{Config.DEFAULT_STOCK}: {spot:,.1f}</span>',
+        unsafe_allow_html=True,
+    )
 
 st.divider()
 
-# --- Active Strategies ---
-st.subheader("📋 Active Strategies")
+
+# ═══════════════════════════════════════════════════════════════
+# SIDEBAR — Configuration & Controls
+# ═══════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.header("⚙️ Strategy Deployer")
+
+    stock_code = st.selectbox("Underlying", ["NIFTY", "BANKNIFTY"], index=0)
+    breeze_stock = "CNXBAN" if stock_code == "BANKNIFTY" else "NIFTY"
+    expiry_dt = next_weekly_expiry(breeze_stock)
+    expiry_str = breeze_date(expiry_dt)
+    st.text(f"Expiry: {expiry_dt.strftime('%d-%b-%Y')}")
+
+    lots = st.number_input("Lots", min_value=1, max_value=50, value=1)
+    sl_pct = st.slider("SL %", min_value=10, max_value=200, value=int(Config.SL_PERCENTAGE))
+
+    st.subheader("Short Straddle")
+    if st.button("🔴 Deploy Straddle", use_container_width=True, type="primary"):
+        with st.spinner("Deploying Straddle…"):
+            result = engine.deploy_straddle(breeze_stock, expiry_str, lots, float(sl_pct))
+        if result:
+            st.success(f"Straddle deployed: {result.strategy_id}")
+        else:
+            st.error("Straddle deployment failed")
+
+    st.subheader("Short Strangle")
+    target_delta = st.slider("Target Delta", 0.05, 0.40, 0.15, 0.01)
+    if st.button("🔴 Deploy Strangle", use_container_width=True, type="primary"):
+        with st.spinner("Deploying Strangle…"):
+            result = engine.deploy_strangle(
+                breeze_stock, target_delta, expiry_str, lots, float(sl_pct)
+            )
+        if result:
+            st.success(f"Strangle deployed: {result.strategy_id}")
+        else:
+            st.error("Strangle deployment failed")
+
+    st.divider()
+    st.subheader("🚨 Kill Switch")
+    if st.button("⚠️ PANIC EXIT — Close All", use_container_width=True,
+                 type="primary"):
+        engine.trigger_panic_exit()
+        st.error("PANIC EXIT TRIGGERED")
+
+    st.divider()
+    st.caption(f"Mode: **{Config.TRADING_MODE.upper()}**")
+    st.caption(f"Rate limit remaining: {__import__('rate_limiter').get_rate_limiter().remaining}")
+    st.caption(f"Last refresh: {datetime.now().strftime('%H:%M:%S')}")
 
 
-@st.fragment(run_every=2)
-def render_strategies():
-    strategies = engine.state.get_all_strategies()
+# ═══════════════════════════════════════════════════════════════
+# MAIN BODY — Tabs
+# ═══════════════════════════════════════════════════════════════
+
+tab_chain, tab_positions, tab_logs = st.tabs([
+    "📈 Option Chain", "📋 Active Positions", "📝 Logs"
+])
+
+
+# ── Tab 1: Option Chain ─────────────────────────────────────
+
+with tab_chain:
+    st.subheader(f"Option Chain — {stock_code}")
+
+    chain_placeholder = st.empty()
+
+    try:
+        chain_data = engine.get_chain_with_greeks(breeze_stock, expiry_str)
+    except Exception as e:
+        chain_data = []
+        st.warning(f"Chain fetch error: {e}")
+
+    if chain_data:
+        df = pd.DataFrame(chain_data)
+
+        # Split into CE and PE
+        df_ce = df[df["right"] == "CALL"].rename(columns={
+            "ltp": "CE LTP", "bid": "CE Bid", "ask": "CE Ask",
+            "iv": "CE IV%", "delta": "CE Δ", "theta": "CE Θ",
+            "vega": "CE V", "oi": "CE OI",
+        })[["strike", "CE OI", "CE IV%", "CE Δ", "CE Θ", "CE V", "CE Bid", "CE LTP", "CE Ask"]]
+
+        df_pe = df[df["right"] == "PUT"].rename(columns={
+            "ltp": "PE LTP", "bid": "PE Bid", "ask": "PE Ask",
+            "iv": "PE IV%", "delta": "PE Δ", "theta": "PE Θ",
+            "vega": "PE V", "oi": "PE OI",
+        })[["strike", "PE Bid", "PE LTP", "PE Ask", "PE Δ", "PE Θ", "PE V", "PE IV%", "PE OI"]]
+
+        merged = pd.merge(df_ce, df_pe, on="strike", how="outer").sort_values("strike")
+        merged = merged.fillna(0)
+
+        with chain_placeholder.container():
+            st.dataframe(
+                merged,
+                use_container_width=True,
+                height=500,
+                hide_index=True,
+            )
+    else:
+        chain_placeholder.info("No chain data available. Engine may still be connecting.")
+
+
+# ── Tab 2: Active Positions ─────────────────────────────────
+
+with tab_positions:
+    st.subheader("Active Strategies & Legs")
+
+    strategies = state.get_strategies()
 
     if not strategies:
         st.info("No active strategies. Deploy one from the sidebar.")
-        return
-
-    for sid, strat in strategies.items():
-        status_emoji = {
-            "active": "🟢",
-            "initializing": "⏳",
-            "entering": "⏳",
-            "exiting": "🟡",
-            "closed": "⚫",
-            "error": "🔴",
-        }.get(strat.get("status", ""), "❓")
-
-        with st.expander(
-            f"{status_emoji} {strat.get('name', '').upper()} | "
-            f"{sid} | "
-            f"CE={strat.get('ce_strike', 'N/A')} / "
-            f"PE={strat.get('pe_strike', 'N/A')} | "
-            f"MTM: ₹{strat.get('current_mtm', 0):,.0f}",
-            expanded=(strat.get("status") == "active"),
-        ):
-            c1, c2, c3, c4 = st.columns(4)
-
-            with c1:
-                st.metric("CE Strike", strat.get("ce_strike", "N/A"))
-                st.metric("CE Entry", f"₹{strat.get('ce_entry_price', 0):.2f}")
-                ce_ltp = engine.state.get_ltp(
-                    strat.get("stock_code", ""),
-                    strat.get("ce_strike", 0), "call"
-                )
-                st.metric("CE LTP", f"₹{ce_ltp:.2f}" if ce_ltp > 0 else "—")
-                st.metric("CE SL", f"₹{strat.get('ce_sl_price', 0):.2f}")
-
-            with c2:
-                st.metric("PE Strike", strat.get("pe_strike", "N/A"))
-                st.metric("PE Entry", f"₹{strat.get('pe_entry_price', 0):.2f}")
-                pe_ltp = engine.state.get_ltp(
-                    strat.get("stock_code", ""),
-                    strat.get("pe_strike", 0), "put"
-                )
-                st.metric("PE LTP", f"₹{pe_ltp:.2f}" if pe_ltp > 0 else "—")
-                st.metric("PE SL", f"₹{strat.get('pe_sl_price', 0):.2f}")
-
-            with c3:
-                st.metric("Status", strat.get("status", "").upper())
-                st.metric("Lots", strat.get("lots", 1))
-                st.metric("Premium", f"₹{strat.get('total_premium', 0):,.0f}")
-                st.metric("MTM", f"₹{strat.get('current_mtm', 0):,.0f}")
-
-            with c4:
-                # Greeks display
-                if strat.get("status") == "active":
-                    ce_g = engine.state.get_greeks(
-                        strat.get("stock_code", ""),
-                        strat.get("ce_strike", 0), "call"
-                    )
-                    pe_g = engine.state.get_greeks(
-                        strat.get("stock_code", ""),
-                        strat.get("pe_strike", 0), "put"
-                    )
-                    st.caption("**Net Greeks**")
-                    net_delta = ce_g.delta + pe_g.delta
-                    net_theta = ce_g.theta + pe_g.theta
-                    st.metric("Net Δ", f"{net_delta:.4f}")
-                    st.metric("Net Θ", f"₹{net_theta:.2f}/day")
-                    st.metric("CE IV", f"{ce_g.iv:.1%}")
-                    st.metric("PE IV", f"{pe_g.iv:.1%}")
-
-            # Exit buttons
-            if strat.get("status") in ("active", "entering"):
-                bcol1, bcol2 = st.columns(2)
-                with bcol1:
-                    if st.button(f"Exit (Chase) — {sid}",
-                                 key=f"exit_{sid}"):
-                        engine.exit_strategy(sid, use_market=False)
-                        st.toast(f"Exiting {sid}...")
-                        time.sleep(1)
-                        st.rerun()
-                with bcol2:
-                    if st.button(f"Exit (Market) — {sid}",
-                                 key=f"mkt_exit_{sid}",
-                                 type="primary"):
-                        engine.exit_strategy(sid, use_market=True)
-                        st.toast(f"Market exit {sid}...")
-                        time.sleep(1)
-                        st.rerun()
-
-
-render_strategies()
-
-st.divider()
-
-# --- Option Chain Viewer ---
-st.subheader("🔗 Option Chain")
-
-
-@st.fragment(run_every=5)
-def render_option_chain():
-    if not engine.is_running:
-        st.info("Connect to view option chain.")
-        return
-
-    oc_inst = st.selectbox("Chain Instrument",
-                           list(INSTRUMENTS.keys()),
-                           key="oc_instrument",
-                           index=0)
-    oc_expiries = engine.get_expiry_dates(oc_inst)
-    oc_expiry = st.selectbox("Chain Expiry",
-                             oc_expiries if oc_expiries else ["N/A"],
-                             key="oc_expiry")
-
-    if oc_expiry == "N/A":
-        return
-
-    if st.button("Refresh Chain", key="refresh_chain"):
-        chain = engine.refresh_option_chain(oc_inst, oc_expiry)
-        if chain:
-            st.session_state["_chain_data"] = chain
-            st.session_state["_chain_inst"] = oc_inst
-            st.session_state["_chain_expiry"] = oc_expiry
-
-    chain = st.session_state.get("_chain_data", [])
-    if not chain:
-        st.info("Click 'Refresh Chain' to load data.")
-        return
-
-    spec = CFG.get_instrument(oc_inst)
-    spot = engine.state.get_spot(spec.stock_code)
-
-    # Parse into DataFrame
-    ce_data = {}
-    pe_data = {}
-    for rec in chain:
-        try:
-            strike = float(rec.get("strike_price", 0))
-            right_raw = rec.get("right", "").lower()
-            ltp = float(rec.get("ltp", 0))
-            bid = float(rec.get("best_bid_price", 0))
-            ask = float(rec.get("best_offer_price", 0))
-            oi = rec.get("open_interest", "0")
-
-            row = {
-                "LTP": round(ltp, 2),
-                "Bid": round(bid, 2),
-                "Ask": round(ask, 2),
-                "OI": oi,
-            }
-
-            # Compute delta
-            tte = engine.greeks_engine.time_to_expiry_years(oc_expiry)
-            if ltp > 0 and spot > 0 and tte > 0:
-                right = "call" if "call" in right_raw else "put"
-                greeks = engine.greeks_engine.compute_for_strike(
-                    spot, strike, tte, ltp, right
-                )
-                row["Δ"] = round(greeks.delta, 4)
-                row["IV"] = f"{greeks.iv:.1%}"
-                row["Θ"] = round(greeks.theta, 2)
-
-            if "call" in right_raw:
-                ce_data[strike] = row
-            else:
-                pe_data[strike] = row
-        except (ValueError, TypeError):
-            continue
-
-    all_strikes = sorted(set(list(ce_data.keys()) + list(pe_data.keys())))
-
-    # Build combined table
-    rows = []
-    for strike in all_strikes:
-        ce = ce_data.get(strike, {})
-        pe = pe_data.get(strike, {})
-        rows.append({
-            "CE Δ": ce.get("Δ", ""),
-            "CE IV": ce.get("IV", ""),
-            "CE Θ": ce.get("Θ", ""),
-            "CE OI": ce.get("OI", ""),
-            "CE Bid": ce.get("Bid", ""),
-            "CE LTP": ce.get("LTP", ""),
-            "CE Ask": ce.get("Ask", ""),
-            "STRIKE": int(strike),
-            "PE Bid": pe.get("Bid", ""),
-            "PE LTP": pe.get("LTP", ""),
-            "PE Ask": pe.get("Ask", ""),
-            "PE OI": pe.get("OI", ""),
-            "PE Θ": pe.get("Θ", ""),
-            "PE IV": pe.get("IV", ""),
-            "PE Δ": pe.get("Δ", ""),
-        })
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        # Highlight ATM
-        atm_strike = min(all_strikes, key=lambda s: abs(s - spot)) if spot > 0 else 0
-        st.caption(f"Spot: {spot:.2f} | ATM: {int(atm_strike)}")
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            height=500,
-        )
     else:
-        st.warning("No chain data parsed.")
+        for strategy in strategies:
+            status_emoji = {
+                StrategyStatus.ACTIVE: "🟢",
+                StrategyStatus.DEPLOYING: "🟡",
+                StrategyStatus.PARTIAL_EXIT: "🟠",
+                StrategyStatus.CLOSED: "⚫",
+                StrategyStatus.ERROR: "🔴",
+            }.get(strategy.status, "⚪")
+
+            pnl = strategy.compute_total_pnl()
+            pnl_color = "green" if pnl >= 0 else "red"
+
+            with st.expander(
+                f"{status_emoji} {strategy.strategy_type.value.upper()} "
+                f"[{strategy.strategy_id}] — "
+                f"P&L: :{pnl_color}[₹{pnl:+,.2f}]",
+                expanded=(strategy.status == StrategyStatus.ACTIVE),
+            ):
+                leg_rows = []
+                for leg in strategy.legs:
+                    leg_rows.append({
+                        "Leg": leg.leg_id[:6],
+                        "Type": f"{leg.right.value.upper()[0]}E",
+                        "Strike": leg.strike_price,
+                        "Entry": leg.entry_price,
+                        "LTP": leg.current_price,
+                        "SL": leg.sl_price,
+                        "P&L": round(leg.pnl, 2),
+                        "Δ": round(leg.greeks.delta, 4),
+                        "Θ": round(leg.greeks.theta, 2),
+                        "IV%": round(leg.greeks.iv * 100, 1),
+                        "Status": leg.status.value,
+                    })
+                if leg_rows:
+                    leg_df = pd.DataFrame(leg_rows)
+
+                    def color_pnl(val):
+                        if isinstance(val, (int, float)):
+                            return "color: #00ff88" if val >= 0 else "color: #ff4444"
+                        return ""
+
+                    def color_status(val):
+                        colors = {
+                            "active": "background-color: #0d4d2b; color: #00ff88",
+                            "squared_off": "background-color: #333; color: #aaa",
+                            "sl_triggered": "background-color: #4d0d0d; color: #ff4444",
+                            "error": "background-color: #4d0d0d; color: #ff4444",
+                            "entering": "background-color: #4d4d0d; color: #ffff44",
+                        }
+                        return colors.get(val, "")
+
+                    styled = leg_df.style.applymap(
+                        color_pnl, subset=["P&L"]
+                    ).applymap(
+                        color_status, subset=["Status"]
+                    )
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.metric("Strategy P&L", f"₹{pnl:+,.2f}")
+                with col_b:
+                    st.metric("Status", strategy.status.value.upper())
 
 
-render_option_chain()
+# ── Tab 3: Logs ──────────────────────────────────────────────
+
+with tab_logs:
+    st.subheader("System Logs")
+
+    log_col1, log_col2 = st.columns([3, 2])
+
+    with log_col1:
+        st.markdown("**Agent Thoughts & Events**")
+        logs = state.get_logs(100)
+
+        if logs:
+            log_lines = []
+            for entry in reversed(logs):
+                level_color = {
+                    "INFO": "#88ccff",
+                    "WARN": "#ffcc44",
+                    "ERROR": "#ff4444",
+                    "CRIT": "#ff0000",
+                }.get(entry.level, "#cccccc")
+                log_lines.append(
+                    f'<span style="color:{level_color}">[{entry.timestamp}] '
+                    f'{entry.level:5s}</span> │ '
+                    f'<span style="color:#aaa">{entry.source:12s}</span> │ '
+                    f'{entry.message}'
+                )
+            html = '<div class="log-container">' + "<br>".join(log_lines) + "</div>"
+            st.markdown(html, unsafe_allow_html=True)
+        else:
+            st.info("No log entries yet.")
+
+    with log_col2:
+        st.markdown("**Order History**")
+        try:
+            order_logs = engine.db.get_recent_order_logs(30)
+            if order_logs:
+                ol_df = pd.DataFrame(order_logs)
+                display_cols = [c for c in ["timestamp", "action", "status", "price",
+                                            "quantity", "order_id", "message"]
+                                if c in ol_df.columns]
+                st.dataframe(ol_df[display_cols], use_container_width=True,
+                             hide_index=True, height=400)
+            else:
+                st.info("No orders yet.")
+        except Exception as e:
+            st.warning(f"Order log error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# FOOTER
+# ═══════════════════════════════════════════════════════════════
 
 st.divider()
-
-# --- Positions Table ---
-st.subheader("📊 Open Positions")
-
-
-@st.fragment(run_every=2)
-def render_positions():
-    positions = engine.state.get_open_positions()
-    if not positions:
-        st.info("No open positions.")
-        return
-
-    rows = []
-    for pid, pos in positions.items():
-        stock_code = pos.get("stock_code", "")
-        strike = pos.get("strike_price", 0)
-        right = pos.get("right_type", "")
-        current = engine.state.get_ltp(stock_code, strike, right)
-        greeks = engine.state.get_greeks(stock_code, strike, right)
-
-        rows.append({
-            "ID": pid[:8],
-            "Strike": int(strike),
-            "Type": right.upper()[:1] + "E",
-            "Qty": pos.get("quantity", 0),
-            "Entry": pos.get("entry_price", 0),
-            "LTP": round(current, 2) if current > 0 else "—",
-            "SL": pos.get("sl_price", 0),
-            "P&L": f"₹{pos.get('pnl', 0):,.0f}",
-            "Δ": round(greeks.delta, 4),
-            "IV": f"{greeks.iv:.1%}",
-            "Status": pos.get("status", "").upper(),
-        })
-
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-
-render_positions()
-
-st.divider()
-
-# --- Live Logs ---
-st.subheader("📝 Agent Logs")
-
-
-@st.fragment(run_every=1)
-def render_logs():
-    logs = engine.state.get_logs(100)
-
-    if not logs:
-        st.info("No log entries yet.")
-        return
-
-    log_html = []
-    for entry in reversed(logs):
-        level = entry.get("level", "INFO").upper()
-        css_class = {
-            "ERROR": "log-error",
-            "WARN": "log-warn",
-            "WARNING": "log-warn",
-            "CRITICAL": "log-critical",
-        }.get(level, "log-info")
-
-        ts = entry.get("ts", "")
-        source = entry.get("source", "")
-        msg = entry.get("message", "")
-
-        log_html.append(
-            f'<div class="log-entry {css_class}">'
-            f'[{ts}] [{level:8s}] [{source:10s}] {msg}'
-            f'</div>'
-        )
-
-    st.markdown("\n".join(log_html), unsafe_allow_html=True)
-
-
-render_logs()
-
-# --- Footer ---
-st.divider()
-st.caption(
-    f"Options Terminal v1.0 | Mode: {CFG.trading_mode} | "
-    f"DB: {CFG.db_path} | "
-    f"Rate Limit: {CFG.api_rate_limit}/{CFG.api_rate_period}s"
-)
+footer_cols = st.columns(4)
+with footer_cols[0]:
+    st.caption(f"Mode: {Config.TRADING_MODE.upper()}")
+with footer_cols[1]:
+    st.caption(f"DB: {Config.DB_PATH}")
+with footer_cols[2]:
+    active_count = sum(1 for s in strategies if s.status == StrategyStatus.ACTIVE)
+    st.caption(f"Active strategies: {active_count}")
+with footer_cols[3]:
+    if state.panic_triggered:
+        st.markdown("🚨 **PANIC MODE**")
+    else:
+        st.caption(f"Engine: {'Running' if state.engine_running else 'Stopped'}")
