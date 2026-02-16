@@ -67,7 +67,7 @@ class Config:
     }
 
     LOT_SIZES: dict = {
-        "NIFTY": int(_get("NIFTY_LOT_SIZE", "25")),
+        "NIFTY": int(_get("NIFTY_LOT_SIZE", "65")),
         "CNXBAN": int(_get("BANKNIFTY_LOT_SIZE", "15")),
     }
 
