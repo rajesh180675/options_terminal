@@ -1,205 +1,176 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: mock_breeze.py
+# ═══════════════════════════════════════════════════════════════
 """
-mock_breeze.py — Full MockBreeze class that simulates BreezeConnect for paper trading.
-Generates realistic tick data using Black-Scholes pricing.
+Complete BreezeConnect mock that simulates:
+  • Session generation
+  • WebSocket tick generation (random-walk underlying + BS option prices)
+  • Option chain snapshot
+  • Order placement / cancellation / modification with realistic fills
 """
 
-from __future__ import annotations
-
+import time
 import math
 import random
 import threading
-import time
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from datetime import datetime
+from typing import Callable, Optional, Dict, List
 
-from greeks_engine import BlackScholes
+from greeks_engine import BlackScholes, compute_time_to_expiry
+from models import OptionRight
+from config import Config
+from utils import LOG, breeze_date, next_weekly_expiry, safe_float
 
 
 class MockOrder:
-    def __init__(self, order_id: str, stock_code: str, action: str,
-                 strike_price: float, right: str, quantity: int,
-                 price: float, order_type: str, expiry_date: str):
+    def __init__(self, order_id, stock_code, exchange_code, strike_price,
+                 right, expiry_date, action, order_type, price, quantity):
         self.order_id = order_id
         self.stock_code = stock_code
-        self.action = action
-        self.strike_price = strike_price
+        self.exchange_code = exchange_code
+        self.strike_price = float(strike_price)
         self.right = right
-        self.quantity = quantity
-        self.price = price
-        self.order_type = order_type
         self.expiry_date = expiry_date
+        self.action = action
+        self.order_type = order_type
+        self.price = float(price)
+        self.quantity = int(quantity)
         self.status = "pending"
-        self.filled_price = 0.0
-        self.filled_qty = 0
-        self.created_at = datetime.now(timezone.utc).isoformat()
+        self.fill_price = 0.0
+        self.timestamp = datetime.now().isoformat()
 
 
 class MockBreeze:
     """
-    Complete mock of BreezeConnect for testing.
-    Simulates live market data, order fills, and position tracking.
+    Full simulation of BreezeConnect for offline development and testing.
+    Generates a GBM random walk for the underlying and prices options via BS.
     """
 
     def __init__(self, api_key: str = "mock_key"):
         self.api_key = api_key
-        self.session_generated = False
-        self.ws_connected = False
-        self.on_ticks: Callable | None = None
+        self._session_active = False
+        self._ws_running = False
+        self._ws_thread: Optional[threading.Thread] = None
+        self._subscriptions: List[Dict] = []
+        self._orders: Dict[str, MockOrder] = {}
+        self._positions: Dict[str, dict] = {}
 
-        # Simulated market state
-        self._spot_prices: dict[str, float] = {
-            "NIFTY": 24500.0,
-            "CNXBAN": 52000.0,
+        # Underlying simulation
+        self._spot: Dict[str, float] = {
+            "NIFTY": 23500.0,
+            "CNXBAN": 50000.0,
+            "BANKNIFTY": 50000.0,
         }
-        self._volatility: dict[str, float] = {
-            "NIFTY": 0.13,
-            "CNXBAN": 0.15,
-        }
-        self._subscriptions: list[dict] = []
-        self._orders: dict[str, MockOrder] = {}
-        self._positions: list[dict] = []
+        self._vol = 0.15  # annualised vol for GBM
+        self._dt = 0.5    # tick interval in seconds
+        self._r = Config.RISK_FREE_RATE
 
-        self._ws_thread: threading.Thread | None = None
-        self._ws_stop = threading.Event()
+        # Callback
+        self.on_ticks: Optional[Callable] = None
+
         self._lock = threading.Lock()
 
-        # Drift parameters for realistic simulation
-        self._drift_speed = 0.0003  # per tick
-        self._tick_interval = 0.5   # seconds between ticks
+    # ── Session ──────────────────────────────────────────────
 
-    # ------------------------------------------------------- session
-    def generate_session(self, api_secret: str = "", session_token: str = "") -> dict:
-        self.session_generated = True
-        return {
-            "Success": {"session_token": "mock_session_" + uuid.uuid4().hex[:8]},
-            "Status": 200,
-            "Error": None,
-        }
+    def generate_session(self, api_secret: str, session_token: str) -> dict:
+        LOG.info("[MockBreeze] Session generated (mock)")
+        self._session_active = True
+        return {"Success": {"session_token": "mock_session_token"}, "Status": 200, "Error": None}
 
-    # --------------------------------------------------- websocket
-    def connect(self):
-        """Start the mock WebSocket tick generator."""
-        if self._ws_thread and self._ws_thread.is_alive():
+    # ── WebSocket ────────────────────────────────────────────
+
+    def ws_connect(self):
+        if self._ws_running:
             return
-        self.ws_connected = True
-        self._ws_stop.clear()
-        self._ws_thread = threading.Thread(target=self._tick_generator,
-                                           daemon=True, name="MockWS")
+        self._ws_running = True
+        self._ws_thread = threading.Thread(
+            target=self._ws_loop, daemon=True, name="MockWS"
+        )
         self._ws_thread.start()
+        LOG.info("[MockBreeze] WebSocket connected (mock)")
 
-    def disconnect(self):
-        self._ws_stop.set()
-        self.ws_connected = False
-        if self._ws_thread:
-            self._ws_thread.join(timeout=5)
+    def ws_disconnect(self):
+        self._ws_running = False
+        LOG.info("[MockBreeze] WebSocket disconnected (mock)")
 
-    def _tick_generator(self):
-        """Generates realistic ticks for all subscribed instruments."""
-        while not self._ws_stop.is_set():
-            # Random-walk the spot prices
-            with self._lock:
-                for code in self._spot_prices:
-                    drift = random.gauss(0, self._drift_speed)
-                    self._spot_prices[code] *= (1 + drift)
-
-                # Also slight vol changes
-                for code in self._volatility:
-                    vol_drift = random.gauss(0, 0.0001)
-                    self._volatility[code] = max(
-                        0.05, min(0.50, self._volatility[code] + vol_drift)
-                    )
-
-            # Generate ticks for each subscription
+    def _ws_loop(self):
+        """Generates ticks every self._dt seconds for all subscriptions."""
+        while self._ws_running:
+            self._evolve_spot()
             with self._lock:
                 subs = list(self._subscriptions)
-
             for sub in subs:
                 tick = self._generate_tick(sub)
                 if tick and self.on_ticks:
                     try:
                         self.on_ticks(tick)
-                    except Exception:
-                        pass
-
-            # Also attempt to fill pending orders
+                    except Exception as e:
+                        LOG.error(f"[MockBreeze] on_ticks error: {e}")
             self._try_fill_orders()
+            time.sleep(self._dt)
 
-            self._ws_stop.wait(self._tick_interval)
+    def _evolve_spot(self):
+        """GBM step for each underlying."""
+        with self._lock:
+            for code in self._spot:
+                S = self._spot[code]
+                dt_years = self._dt / (365.25 * 24 * 3600)
+                drift = (self._r - 0.5 * self._vol**2) * dt_years
+                diffusion = self._vol * math.sqrt(dt_years) * random.gauss(0, 1)
+                self._spot[code] = S * math.exp(drift + diffusion)
 
-    def _generate_tick(self, sub: dict) -> dict | None:
+    def _generate_tick(self, sub: dict) -> Optional[dict]:
         stock_code = sub.get("stock_code", "NIFTY")
         strike = float(sub.get("strike_price", 0))
-        right = sub.get("right", "call").lower()
+        right_str = sub.get("right", "call").lower()
         expiry = sub.get("expiry_date", "")
+        right = OptionRight.CALL if "call" in right_str else OptionRight.PUT
 
         with self._lock:
-            spot = self._spot_prices.get(stock_code, 24500.0)
-            vol = self._volatility.get(stock_code, 0.15)
+            S = self._spot.get(stock_code, 23500.0)
 
-        # Calculate time to expiry
-        tte = self._calc_tte(expiry)
-        if tte <= 0:
-            tte = 1 / (365.25 * 24 * 60)
+        T = compute_time_to_expiry(expiry)
+        iv = self._vol + random.uniform(-0.01, 0.01)
+        iv = max(iv, 0.05)
+        bs_price = BlackScholes.price(S, strike, T, self._r, iv, right)
+        bs_price = max(bs_price, 0.05)
 
-        # BS price
-        r = 0.07
-        if right == "call":
-            theo = BlackScholes.call_price(spot, strike, tte, r, vol)
-        else:
-            theo = BlackScholes.put_price(spot, strike, tte, r, vol)
-
-        # Add noise for bid-ask spread
-        spread = max(0.05, theo * 0.002)
-        noise = random.gauss(0, spread * 0.3)
-        ltp = max(0.05, theo + noise)
-        bid = max(0.05, ltp - spread / 2)
-        ask = ltp + spread / 2
+        spread = max(0.05, bs_price * 0.002)
+        bid = round(bs_price - spread, 2)
+        ask = round(bs_price + spread, 2)
+        ltp = round(bs_price + random.uniform(-spread, spread), 2)
+        ltp = max(ltp, 0.05)
 
         return {
-            "symbol": f"{stock_code}{strike}{right[0].upper()}E",
             "stock_code": stock_code,
+            "exchange_code": "NFO",
+            "product_type": "options",
             "strike_price": str(strike),
-            "right": "Call" if right == "call" else "Put",
+            "right": "Call" if right == OptionRight.CALL else "Put",
             "expiry_date": expiry,
-            "ltp": round(ltp, 2),
-            "best_bid_price": round(bid, 2),
-            "best_offer_price": round(ask, 2),
-            "best_bid_quantity": random.randint(50, 5000),
-            "best_offer_quantity": random.randint(50, 5000),
-            "open": round(ltp * 0.98, 2),
-            "high": round(ltp * 1.03, 2),
-            "low": round(ltp * 0.97, 2),
-            "previous_close": round(ltp * 0.99, 2),
-            "total_quantity_traded": random.randint(10000, 500000),
-            "open_interest": random.randint(100000, 5000000),
-            "spot_price": round(spot, 2),
+            "ltp": str(round(ltp, 2)),
+            "best_bid_price": str(round(max(bid, 0.05), 2)),
+            "best_offer_price": str(round(max(ask, 0.05), 2)),
+            "ltq": str(random.randint(25, 500)),
+            "ltt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+            "total_quantity_traded": str(random.randint(10000, 500000)),
+            "open_interest": str(random.randint(100000, 5000000)),
         }
 
-    def _calc_tte(self, expiry_str: str) -> float:
-        try:
-            if "T" in expiry_str:
-                expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
-            else:
-                expiry = datetime.strptime(expiry_str, "%Y-%m-%d").replace(
-                    hour=15, minute=30, tzinfo=timezone.utc
-                )
-            now = datetime.now(timezone.utc)
-            return max((expiry - now).total_seconds() / (365.25 * 24 * 3600), 0)
-        except Exception:
-            return 7 / 365.25
+    # ── Subscription ─────────────────────────────────────────
 
-    # ------------------------------------------------------ subscribe
-    def subscribe_feeds(self, exchange_code: str = "NFO",
-                        stock_code: str = "NIFTY",
-                        product_type: str = "options",
-                        expiry_date: str = "",
-                        strike_price: str = "0",
-                        right: str = "call",
-                        get_exchange_quotes: bool = True,
-                        get_market_depth: bool = False,
-                        stock_token: str = "",
-                        interval: str = "") -> dict:
+    def subscribe_feeds(
+        self,
+        exchange_code: str = "NFO",
+        stock_code: str = "NIFTY",
+        product_type: str = "options",
+        expiry_date: str = "",
+        strike_price: str = "",
+        right: str = "call",
+        get_exchange_quotes: bool = True,
+        get_market_depth: bool = False,
+    ) -> dict:
         sub = {
             "exchange_code": exchange_code,
             "stock_code": stock_code,
@@ -209,261 +180,244 @@ class MockBreeze:
             "right": right,
         }
         with self._lock:
-            # Avoid duplicate subscriptions
-            if sub not in self._subscriptions:
-                self._subscriptions.append(sub)
-        return {"Success": "Feed subscribed", "Status": 200, "Error": None}
+            self._subscriptions.append(sub)
+        LOG.info(f"[MockBreeze] Subscribed: {stock_code} {strike_price} {right}")
+        return {"Success": None, "Status": 200, "Error": None}
 
-    def unsubscribe_feeds(self, exchange_code: str = "NFO",
-                          stock_code: str = "NIFTY",
-                          product_type: str = "options",
-                          expiry_date: str = "",
-                          strike_price: str = "0",
-                          right: str = "call",
-                          get_exchange_quotes: bool = True,
-                          get_market_depth: bool = False,
-                          stock_token: str = "",
-                          interval: str = "") -> dict:
-        sub = {
-            "exchange_code": exchange_code,
-            "stock_code": stock_code,
-            "product_type": product_type,
-            "expiry_date": expiry_date,
-            "strike_price": strike_price,
-            "right": right,
-        }
+    def unsubscribe_feeds(self, **kwargs) -> dict:
         with self._lock:
-            self._subscriptions = [s for s in self._subscriptions if s != sub]
-        return {"Success": "Feed unsubscribed", "Status": 200, "Error": None}
+            self._subscriptions = [
+                s for s in self._subscriptions
+                if not all(s.get(k) == v for k, v in kwargs.items() if k in s)
+            ]
+        return {"Success": None, "Status": 200, "Error": None}
 
-    # ------------------------------------------------------ option chain
-    def get_option_chain_quotes(self, stock_code: str = "NIFTY",
-                                exchange_code: str = "NFO",
-                                product_type: str = "options",
-                                expiry_date: str = "",
-                                right: str = "",
-                                strike_price: str = "") -> dict:
-        """Return a simulated option chain centered around spot."""
+    # ── Option chain ─────────────────────────────────────────
+
+    def get_option_chain_quotes(
+        self,
+        stock_code: str = "NIFTY",
+        exchange_code: str = "NFO",
+        product_type: str = "options",
+        expiry_date: str = "",
+        right: str = "others",
+    ) -> dict:
         with self._lock:
-            spot = self._spot_prices.get(stock_code, 24500.0)
-            vol = self._volatility.get(stock_code, 0.15)
+            S = self._spot.get(stock_code, 23500.0)
 
-        gap = 50 if stock_code == "NIFTY" else 100
-        atm = round(spot / gap) * gap
-        strikes = [atm + i * gap for i in range(-15, 16)]
-        tte = self._calc_tte(expiry_date)
-        r = 0.07
+        gap = Config.strike_gap(stock_code)
+        atm = round(S / gap) * gap
+        strikes = [atm + i * gap for i in range(-10, 11)]
+        T = compute_time_to_expiry(expiry_date)
 
-        records = []
-        rights = ["call", "put"] if not right else [right.lower()]
-
-        for stk in strikes:
-            for rt in rights:
-                if strike_price and float(strike_price) != stk:
-                    continue
-                if rt == "call":
-                    theo = BlackScholes.call_price(spot, stk, tte, r, vol)
-                else:
-                    theo = BlackScholes.put_price(spot, stk, tte, r, vol)
-
-                spread = max(0.05, theo * 0.002)
-                ltp = max(0.05, theo + random.gauss(0, spread * 0.2))
-                bid = max(0.05, ltp - spread / 2)
-                ask = ltp + spread / 2
-
-                records.append({
+        chain = []
+        rights = (
+            [OptionRight.CALL, OptionRight.PUT]
+            if right == "others"
+            else [OptionRight.CALL if "call" in right.lower() else OptionRight.PUT]
+        )
+        for strike in strikes:
+            for opt_right in rights:
+                iv = self._vol + random.uniform(-0.02, 0.02)
+                iv = max(iv, 0.05)
+                price = BlackScholes.price(S, strike, T, self._r, iv, opt_right)
+                price = max(price, 0.05)
+                spread = max(0.05, price * 0.003)
+                chain.append({
                     "stock_code": stock_code,
-                    "exchange_code": exchange_code,
-                    "product_type": "options",
+                    "strike_price": str(strike),
+                    "right": "Call" if opt_right == OptionRight.CALL else "Put",
                     "expiry_date": expiry_date,
-                    "strike_price": str(stk),
-                    "right": "Call" if rt == "call" else "Put",
-                    "ltp": round(ltp, 2),
-                    "best_bid_price": round(bid, 2),
-                    "best_offer_price": round(ask, 2),
-                    "open": round(ltp * 0.98, 2),
-                    "high": round(ltp * 1.03, 2),
-                    "low": round(ltp * 0.97, 2),
-                    "previous_close": round(ltp * 0.99, 2),
+                    "ltp": str(round(price, 2)),
+                    "best_bid_price": str(round(max(price - spread, 0.05), 2)),
+                    "best_offer_price": str(round(price + spread, 2)),
+                    "open": str(round(price * 1.02, 2)),
+                    "high": str(round(price * 1.05, 2)),
+                    "low": str(round(price * 0.95, 2)),
+                    "close": str(round(price * 0.99, 2)),
+                    "volume": str(random.randint(10000, 500000)),
                     "open_interest": str(random.randint(100000, 5000000)),
-                    "total_quantity_traded": str(random.randint(10000, 500000)),
-                    "spot_price": str(round(spot, 2)),
                 })
+        return {"Success": chain, "Status": 200, "Error": None}
 
-        return {"Success": records, "Status": 200, "Error": None}
+    # ── Orders ───────────────────────────────────────────────
 
-    # --------------------------------------------------------- orders
-    def place_order(self, stock_code: str = "NIFTY",
-                    exchange_code: str = "NFO",
-                    product: str = "options",
-                    action: str = "sell",
-                    order_type: str = "limit",
-                    stoploss: str = "",
-                    quantity: str = "50",
-                    price: str = "0",
-                    validity: str = "day",
-                    validity_date: str = "",
-                    disclosed_quantity: str = "0",
-                    expiry_date: str = "",
-                    right: str = "call",
-                    strike_price: str = "0",
-                    segment: str = "N",
-                    settlement_id: str = "",
-                    order_type_fresh: str = "",
-                    order_rate_fresh: str = "",
-                    user_remark: str = "") -> dict:
-        oid = "MOCK_" + uuid.uuid4().hex[:10].upper()
+    def place_order(
+        self,
+        stock_code: str = "",
+        exchange_code: str = "NFO",
+        product: str = "options",
+        action: str = "sell",
+        order_type: str = "limit",
+        stoploss: str = "",
+        quantity: str = "25",
+        price: str = "0",
+        validity: str = "day",
+        validity_date: str = "",
+        disclosed_quantity: str = "0",
+        expiry_date: str = "",
+        right: str = "call",
+        strike_price: str = "0",
+        settlement_id: str = "",
+        order_segment: str = "N",
+        order_rate_fresh: str = "",
+    ) -> dict:
+        oid = f"MOCK{uuid.uuid4().hex[:8].upper()}"
         order = MockOrder(
             order_id=oid,
             stock_code=stock_code,
-            action=action.lower(),
-            strike_price=float(strike_price),
-            right=right.lower(),
-            quantity=int(quantity),
-            price=float(price),
-            order_type=order_type.lower(),
+            exchange_code=exchange_code,
+            strike_price=strike_price,
+            right=right,
             expiry_date=expiry_date,
+            action=action,
+            order_type=order_type,
+            price=safe_float(price),
+            quantity=int(quantity),
         )
-
-        if order_type.lower() == "market":
-            # Immediate fill at simulated price
-            with self._lock:
-                spot = self._spot_prices.get(stock_code, 24500.0)
-                vol = self._volatility.get(stock_code, 0.15)
-            tte = self._calc_tte(expiry_date)
-            if right.lower() == "call":
-                theo = BlackScholes.call_price(spot, float(strike_price), tte, 0.07, vol)
-            else:
-                theo = BlackScholes.put_price(spot, float(strike_price), tte, 0.07, vol)
-
-            slippage = theo * 0.001 * (1 if action.lower() == "buy" else -1)
-            order.filled_price = round(max(0.05, theo + slippage), 2)
-            order.filled_qty = order.quantity
-            order.status = "filled"
-        else:
-            order.status = "placed"
-
         with self._lock:
             self._orders[oid] = order
+        LOG.info(f"[MockBreeze] Order placed: {oid} {action} {stock_code} "
+                 f"{strike_price}{right[0].upper()} @ {price}")
+        return {"Success": {"order_id": oid}, "Status": 200, "Error": None}
 
-        return {
-            "Success": {"order_id": oid},
-            "Status": 200,
-            "Error": None,
-        }
-
-    def modify_order(self, order_id: str, exchange_code: str = "NFO",
-                     order_type: str = "limit", stoploss: str = "",
-                     quantity: str = "", price: str = "",
-                     validity: str = "day",
-                     disclosed_quantity: str = "0") -> dict:
+    def cancel_order(self, exchange_code: str = "NFO", order_id: str = "") -> dict:
         with self._lock:
-            order = self._orders.get(order_id)
-            if not order:
-                return {"Success": None, "Status": 404, "Error": "Order not found"}
-            if order.status in ("filled", "cancelled"):
-                return {"Success": None, "Status": 400, "Error": "Cannot modify"}
-            if price:
-                order.price = float(price)
-            if quantity:
-                order.quantity = int(quantity)
-            order.order_type = order_type.lower()
-        return {"Success": {"order_id": order_id}, "Status": 200, "Error": None}
+            if order_id in self._orders:
+                self._orders[order_id].status = "cancelled"
+                LOG.info(f"[MockBreeze] Order cancelled: {order_id}")
+                return {"Success": {"order_id": order_id}, "Status": 200, "Error": None}
+        return {"Success": None, "Status": 400, "Error": "Order not found"}
 
-    def cancel_order(self, order_id: str,
-                     exchange_code: str = "NFO") -> dict:
+    def modify_order(
+        self,
+        order_id: str = "",
+        exchange_code: str = "NFO",
+        price: str = "0",
+        quantity: str = "0",
+        **kwargs,
+    ) -> dict:
         with self._lock:
-            order = self._orders.get(order_id)
-            if not order:
-                return {"Success": None, "Status": 404, "Error": "Order not found"}
-            if order.status in ("filled", "cancelled"):
-                return {"Success": None, "Status": 400, "Error": "Cannot cancel"}
-            order.status = "cancelled"
-        return {"Success": {"order_id": order_id}, "Status": 200, "Error": None}
+            if order_id in self._orders:
+                self._orders[order_id].price = safe_float(price)
+                if int(quantity) > 0:
+                    self._orders[order_id].quantity = int(quantity)
+                self._orders[order_id].status = "pending"
+                LOG.info(f"[MockBreeze] Order modified: {order_id} new price={price}")
+                return {"Success": {"order_id": order_id}, "Status": 200, "Error": None}
+        return {"Success": None, "Status": 400, "Error": "Order not found"}
 
-    def get_order_detail(self, exchange_code: str = "NFO",
-                         order_id: str = "") -> dict:
+    def get_order_detail(self, exchange_code: str = "NFO", order_id: str = "") -> dict:
         with self._lock:
-            order = self._orders.get(order_id)
-            if not order:
-                return {"Success": None, "Status": 404, "Error": "Not found"}
-            return {
-                "Success": [{
-                    "order_id": order.order_id,
-                    "status": order.status,
-                    "action": order.action,
-                    "stock_code": order.stock_code,
-                    "strike_price": str(order.strike_price),
-                    "right": order.right,
-                    "quantity": str(order.quantity),
-                    "price": str(order.price),
-                    "filled_price": str(order.filled_price),
-                    "filled_quantity": str(order.filled_qty),
-                    "order_type": order.order_type,
-                    "expiry_date": order.expiry_date,
-                }],
-                "Status": 200,
-                "Error": None,
-            }
+            if order_id in self._orders:
+                o = self._orders[order_id]
+                return {
+                    "Success": [{
+                        "order_id": o.order_id,
+                        "status": o.status,
+                        "action": o.action,
+                        "quantity": str(o.quantity),
+                        "price": str(o.price),
+                        "fill_price": str(o.fill_price),
+                        "stock_code": o.stock_code,
+                        "strike_price": str(o.strike_price),
+                        "right": o.right,
+                        "expiry_date": o.expiry_date,
+                    }],
+                    "Status": 200,
+                    "Error": None,
+                }
+        return {"Success": None, "Status": 400, "Error": "Order not found"}
 
     def get_portfolio_positions(self) -> dict:
-        """Return currently tracked positions."""
         with self._lock:
-            return {
-                "Success": list(self._positions),
-                "Status": 200,
-                "Error": None,
-            }
+            positions = list(self._positions.values())
+        return {"Success": positions if positions else [], "Status": 200, "Error": None}
 
-    def get_quotes(self, stock_code: str = "NIFTY",
-                   exchange_code: str = "NSE",
-                   expiry_date: str = "",
-                   product_type: str = "cash",
-                   right: str = "others",
-                   strike_price: str = "0") -> dict:
-        """Return spot quote for the underlying."""
+    # ── Internal fill engine ─────────────────────────────────
+
+    def _try_fill_orders(self):
         with self._lock:
-            spot = self._spot_prices.get(stock_code, 24500.0)
+            for oid, order in list(self._orders.items()):
+                if order.status not in ("pending",):
+                    continue
+                S = self._spot.get(order.stock_code, 23500.0)
+                right = OptionRight.CALL if "call" in order.right.lower() else OptionRight.PUT
+                T = compute_time_to_expiry(order.expiry_date)
+                iv = self._vol
+                fair = BlackScholes.price(S, order.strike_price, T, self._r, iv, right)
+                fair = max(fair, 0.05)
+
+                # Market orders fill immediately
+                if order.order_type == "market":
+                    slip = random.uniform(0, 0.5)
+                    if order.action == "buy":
+                        order.fill_price = round(fair + slip, 2)
+                    else:
+                        order.fill_price = round(fair - slip, 2)
+                    order.status = "filled"
+                    self._update_position(order)
+                    continue
+
+                # Limit orders: simulate fill probability
+                if order.action == "sell" and order.price >= fair * 0.98:
+                    slip = random.uniform(-0.2, 0.3)
+                    order.fill_price = round(order.price + slip, 2)
+                    order.status = "filled"
+                    self._update_position(order)
+                elif order.action == "buy" and order.price <= fair * 1.02:
+                    slip = random.uniform(-0.3, 0.2)
+                    order.fill_price = round(order.price + slip, 2)
+                    order.status = "filled"
+                    self._update_position(order)
+
+    def _update_position(self, order: MockOrder):
+        key = f"{order.stock_code}|{order.strike_price}|{order.right}|{order.expiry_date}"
+        if key not in self._positions:
+            self._positions[key] = {
+                "stock_code": order.stock_code,
+                "strike_price": str(order.strike_price),
+                "right": order.right,
+                "expiry_date": order.expiry_date,
+                "quantity": 0,
+                "avg_price": 0.0,
+            }
+        pos = self._positions[key]
+        if order.action == "sell":
+            pos["quantity"] -= order.quantity
+        else:
+            pos["quantity"] += order.quantity
+        pos["avg_price"] = order.fill_price
+        if pos["quantity"] == 0:
+            del self._positions[key]
+
+    # ── Helpers ──────────────────────────────────────────────
+
+    def get_spot_price(self, stock_code: str) -> float:
+        with self._lock:
+            return self._spot.get(stock_code, 23500.0)
+
+    def get_quotes(self, stock_code: str = "", exchange_code: str = "",
+                   expiry_date: str = "", product_type: str = "",
+                   right: str = "", strike_price: str = "") -> dict:
+        """Single-quote fetch."""
+        S = self.get_spot_price(stock_code)
+        right_enum = OptionRight.CALL if "call" in right.lower() else OptionRight.PUT
+        T = compute_time_to_expiry(expiry_date)
+        iv = self._vol
+        price = BlackScholes.price(S, float(strike_price), T, self._r, iv, right_enum)
+        price = max(price, 0.05)
+        spread = max(0.05, price * 0.003)
         return {
             "Success": [{
                 "stock_code": stock_code,
-                "ltp": str(round(spot, 2)),
-                "best_bid_price": str(round(spot - 0.5, 2)),
-                "best_offer_price": str(round(spot + 0.5, 2)),
+                "strike_price": strike_price,
+                "right": right,
+                "expiry_date": expiry_date,
+                "ltp": str(round(price, 2)),
+                "best_bid_price": str(round(max(price - spread, 0.05), 2)),
+                "best_offer_price": str(round(price + spread, 2)),
             }],
             "Status": 200,
             "Error": None,
         }
-
-    # ----------------------------------------------------- order fill sim
-    def _try_fill_orders(self):
-        """Attempt to fill pending limit orders based on simulated market."""
-        with self._lock:
-            for oid, order in self._orders.items():
-                if order.status != "placed":
-                    continue
-                spot = self._spot_prices.get(order.stock_code, 24500.0)
-                vol = self._volatility.get(order.stock_code, 0.15)
-                tte = self._calc_tte(order.expiry_date)
-                if order.right == "call":
-                    market = BlackScholes.call_price(
-                        spot, order.strike_price, tte, 0.07, vol
-                    )
-                else:
-                    market = BlackScholes.put_price(
-                        spot, order.strike_price, tte, 0.07, vol
-                    )
-
-                # Simulate fill with ~70% probability if price is close
-                should_fill = False
-                if order.action == "sell" and order.price <= market * 1.005:
-                    should_fill = random.random() < 0.7
-                elif order.action == "buy" and order.price >= market * 0.995:
-                    should_fill = random.random() < 0.7
-
-                if should_fill:
-                    order.status = "filled"
-                    order.filled_price = round(
-                        order.price + random.gauss(0, 0.05), 2
-                    )
-                    order.filled_qty = order.quantity
