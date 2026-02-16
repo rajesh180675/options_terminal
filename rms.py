@@ -1,313 +1,177 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: rms.py
+# ═══════════════════════════════════════════════════════════════
 """
-rms.py — Risk Management System.
-  - Leg-wise stop-loss monitoring
-  - Global kill switch (panic_exit)
-  - Circuit breakers (slippage, latency)
-  - Real-time MTM computation
+Risk Management System:
+  • Per-leg stop-loss monitoring
+  • Global MTM kill threshold
+  • panic_exit() — immediate market close of all NFO positions
+  • Slippage & latency circuit breakers
 """
 
-from __future__ import annotations
-
-import threading
 import time
-from typing import TYPE_CHECKING
+import threading
+from typing import List
 
-from config import CFG, INSTRUMENTS
-from database import TradingDB
+from models import Leg, LegStatus, Strategy, StrategyStatus
+from connection_manager import SessionManager
+from order_manager import OrderManager
+from database import Database
 from shared_state import SharedState
-
-if TYPE_CHECKING:
-    from execution_engine import ExecutionEngine
-    from strategy_engine import StrategyEngine
+from config import Config
+from utils import LOG
 
 
 class RiskManager:
-    """
-    Continuously monitors all open positions and enforces risk rules.
-    Runs in a dedicated background thread.
-    """
+    """Continuously monitors risk and enforces limits."""
 
-    def __init__(self, db: TradingDB, state: SharedState,
-                 executor: "ExecutionEngine",
-                 strategy_engine: "StrategyEngine"):
+    def __init__(
+        self,
+        session: SessionManager,
+        order_mgr: OrderManager,
+        db: Database,
+        state: SharedState,
+    ):
+        self.session = session
+        self.order_mgr = order_mgr
         self.db = db
         self.state = state
-        self.executor = executor
-        self.strategy_engine = strategy_engine
+        self._sl_lock = threading.Lock()
 
-        self._monitor_thread: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._poll_interval = 0.5  # seconds
-
-        # Circuit breaker state
-        self._consecutive_errors = 0
-        self._max_consecutive_errors = 10
-        self._circuit_open = False
-
-    # ----------------------------------------------------- lifecycle
-    def start(self):
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            return
-        self._stop.clear()
-        self._monitor_thread = threading.Thread(
-            target=self._monitor_loop,
-            daemon=True,
-            name="RMS-Monitor",
-        )
-        self._monitor_thread.start()
-        self.state.add_log("INFO", "RMS", "Risk monitor started")
-
-    def stop(self):
-        self._stop.set()
-        if self._monitor_thread:
-            self._monitor_thread.join(timeout=10)
-        self.state.add_log("INFO", "RMS", "Risk monitor stopped")
-
-    # ------------------------------------------------- main loop
-    def _monitor_loop(self):
-        while not self._stop.is_set():
-            try:
-                if self.state.is_kill_switch_active():
-                    self._execute_panic_exit()
-                    self.state.deactivate_kill_switch()
+    def check_stop_losses(self, strategies: List[Strategy]):
+        """
+        Iterate all active legs; if current_price >= sl_price for a short,
+        trigger an immediate market buyback.
+        """
+        with self._sl_lock:
+            for strategy in strategies:
+                if strategy.status not in (StrategyStatus.ACTIVE, StrategyStatus.PARTIAL_EXIT):
                     continue
+                for leg in strategy.legs:
+                    if leg.status != LegStatus.ACTIVE:
+                        continue
+                    # Update current price from ticks
+                    tick = self.state.get_tick(leg.feed_key)
+                    if tick and tick.ltp > 0:
+                        leg.current_price = tick.ltp
+                        leg.compute_pnl()
 
-                if self._circuit_open:
-                    self._stop.wait(5.0)
-                    self._circuit_open = False
-                    self._consecutive_errors = 0
-                    continue
+                    if leg.sl_price > 0 and leg.current_price >= leg.sl_price:
+                        self.state.add_log(
+                            "WARN", "RMS",
+                            f"SL HIT: {leg.stock_code} {leg.strike_price}"
+                            f"{leg.right.value[0].upper()} "
+                            f"LTP={leg.current_price} >= SL={leg.sl_price}"
+                        )
+                        LOG.warning(f"SL triggered for leg {leg.leg_id}")
+                        leg.status = LegStatus.SL_TRIGGERED
+                        self.db.update_leg_status(leg.leg_id, LegStatus.SL_TRIGGERED)
 
-                self._update_positions_and_mtm()
-                self._check_stop_losses()
-                self._check_global_loss()
-                self._check_ws_health()
+                        # Square off immediately
+                        success = self.order_mgr.execute_buy_market(leg)
+                        if success:
+                            leg.status = LegStatus.SQUARED_OFF
+                            self.state.add_log("INFO", "RMS",
+                                               f"SL exit filled: {leg.leg_id} "
+                                               f"exit_price={leg.exit_price}")
+                        else:
+                            leg.status = LegStatus.ERROR
+                            self.state.add_log("ERROR", "RMS",
+                                               f"SL exit FAILED for {leg.leg_id}")
+                        self.db.save_leg(leg)
 
-                self._consecutive_errors = 0
+                        # Check if strategy is now fully closed
+                        active_legs = [l for l in strategy.legs
+                                       if l.status == LegStatus.ACTIVE]
+                        if not active_legs:
+                            strategy.status = StrategyStatus.CLOSED
+                        else:
+                            strategy.status = StrategyStatus.PARTIAL_EXIT
+                        strategy.compute_total_pnl()
+                        self.db.save_strategy(strategy)
 
-            except Exception as e:
-                self._consecutive_errors += 1
-                self.state.add_log("ERROR", "RMS",
-                                   f"Monitor error ({self._consecutive_errors}): {e}")
-                if self._consecutive_errors >= self._max_consecutive_errors:
-                    self.state.add_log("CRITICAL", "RMS",
-                                       "Circuit breaker tripped! "
-                                       "Pausing risk monitor for 5s.")
-                    self._circuit_open = True
+    def check_global_mtm(self, strategies: List[Strategy]) -> bool:
+        """
+        If total MTM across all strategies breaches GLOBAL_MAX_LOSS,
+        trigger panic_exit.
+        Returns True if panic was triggered.
+        """
+        total_mtm = sum(s.compute_total_pnl() for s in strategies
+                        if s.status in (StrategyStatus.ACTIVE, StrategyStatus.PARTIAL_EXIT))
+        self.state.set_total_mtm(total_mtm)
 
-            self._stop.wait(self._poll_interval)
-
-    # ----------------------------------------- position & MTM update
-    def _update_positions_and_mtm(self):
-        """Update current prices and compute real-time MTM for all positions."""
-        positions = self.db.get_open_positions()
-        total_mtm = 0.0
-
-        for pos in positions:
-            stock_code = pos["stock_code"]
-            strike = pos["strike_price"]
-            right = pos["right_type"]
-            qty = pos["quantity"]  # negative for short
-            entry = pos["entry_price"]
-
-            current = self.state.get_ltp(stock_code, strike, right)
-            if current <= 0:
-                current = pos.get("current_price", entry)
-
-            # For short positions: PnL = (entry - current) * abs(qty)
-            pnl = (entry - current) * abs(qty)
-            total_mtm += pnl
-
-            self.db.update_position(
-                pos["id"],
-                current_price=current,
-                pnl=round(pnl, 2),
-            )
-
-            # Mirror to shared state
-            pos_copy = dict(pos)
-            pos_copy["current_price"] = current
-            pos_copy["pnl"] = round(pnl, 2)
-            self.state.set_position(pos["id"], pos_copy)
-
-        self.state.set_total_mtm(round(total_mtm, 2))
-
-        # Update strategy-level MTM
-        active_strategies = self.db.get_active_strategies()
-        for strat in active_strategies:
-            strat_positions = self.db.get_positions_for_strategy(strat["id"])
-            strat_mtm = sum(
-                (p["entry_price"] - (self.state.get_ltp(
-                    p["stock_code"], p["strike_price"], p["right_type"]
-                ) or p["current_price"])) * abs(p["quantity"])
-                for p in strat_positions if p["status"] == "open"
-            )
-            self.db.update_strategy(strat["id"], current_mtm=round(strat_mtm, 2))
-            strat_data = self.db.get_strategy(strat["id"])
-            if strat_data:
-                self.state.set_strategy(strat["id"], strat_data)
-
-    # ------------------------------------------- stop loss checking
-    def _check_stop_losses(self):
-        """Check each leg's SL independently and square off if hit."""
-        positions = self.db.get_open_positions()
-
-        for pos in positions:
-            sl_price = pos.get("sl_price", 0)
-            if sl_price <= 0:
-                continue
-
-            current = self.state.get_ltp(
-                pos["stock_code"], pos["strike_price"], pos["right_type"]
-            )
-            if current <= 0:
-                continue
-
-            # For short positions: SL hit when current >= sl_price
-            if current >= sl_price:
-                self.state.add_log(
-                    "WARN", "RMS",
-                    f"🛑 SL HIT: {pos['strike_price']}"
-                    f"{pos['right_type'][0].upper()}E "
-                    f"LTP={current} >= SL={sl_price}",
-                )
-
-                qty = abs(pos["quantity"])
-                result = self.executor.square_off_position(
-                    strategy_id=pos["strategy_id"],
-                    stock_code=pos["stock_code"],
-                    strike_price=pos["strike_price"],
-                    right=pos["right_type"],
-                    expiry_date=pos["expiry_date"],
-                    quantity=qty,
-                    leg_tag="sl_exit",
-                    use_market=True,
-                )
-
-                if result.success:
-                    pnl = (pos["entry_price"] - result.filled_price) * qty
-                    self.db.update_position(
-                        pos["id"],
-                        status="sl_triggered",
-                        current_price=result.filled_price,
-                        pnl=round(pnl, 2),
-                    )
-                    self.state.add_log(
-                        "INFO", "RMS",
-                        f"SL exit filled @{result.filled_price} "
-                        f"PnL=₹{pnl:,.0f}",
-                    )
-                    self.db.log("WARN", "RMS",
-                                f"SL triggered for position {pos['id']}",
-                                {"filled": result.filled_price, "pnl": pnl})
-
-                    # Check if all legs of strategy are closed
-                    self._check_strategy_completion(pos["strategy_id"])
-                else:
-                    self.state.add_log(
-                        "ERROR", "RMS",
-                        f"SL exit FAILED: {result.error}. "
-                        "Will retry next cycle.",
-                    )
-
-    def _check_strategy_completion(self, sid: str):
-        """If all positions are closed, mark strategy as closed."""
-        positions = self.db.get_positions_for_strategy(sid)
-        open_count = sum(1 for p in positions if p["status"] == "open")
-        if open_count == 0:
-            self.db.update_strategy(sid, status="closed")
-            strat = self.db.get_strategy(sid)
-            if strat:
-                self.state.set_strategy(sid, strat)
-            self.state.add_log("INFO", "RMS",
-                               f"Strategy {sid} fully closed (all legs exited)")
-
-    # ----------------------------------------- global loss check
-    def _check_global_loss(self):
-        """If total MTM loss exceeds threshold, trigger kill switch."""
-        total_mtm = self.state.get_total_mtm()
-        if total_mtm < -CFG.global_max_loss:
+        if total_mtm <= Config.GLOBAL_MAX_LOSS:
             self.state.add_log(
-                "CRITICAL", "RMS",
-                f"🚨 GLOBAL LOSS LIMIT BREACHED: MTM=₹{total_mtm:,.0f} "
-                f"< -₹{CFG.global_max_loss:,.0f}. ACTIVATING KILL SWITCH.",
+                "CRIT", "RMS",
+                f"GLOBAL MTM BREACH: {total_mtm:.2f} <= {Config.GLOBAL_MAX_LOSS}"
             )
-            self.state.activate_kill_switch()
+            LOG.critical(f"Global MTM breach: {total_mtm}")
+            self.panic_exit(strategies)
+            return True
+        return False
 
-    # --------------------------------------------- websocket health
-    def _check_ws_health(self):
-        """Log warning if WebSocket feed is stale."""
-        age = self.state.get_last_tick_age()
-        if age > 10 and self.state.is_engine_running():
-            self.state.add_log("WARN", "RMS",
-                               f"WebSocket feed stale: {age:.0f}s since "
-                               "last tick")
-
-    # ----------------------------------------------- panic exit
-    def _execute_panic_exit(self):
+    def panic_exit(self, strategies: List[Strategy]):
         """
-        KILL SWITCH: Square off ALL open positions at market price.
-        Highest priority — bypasses normal flow.
+        KILL SWITCH: close all active legs at market price immediately.
+        Uses a high-priority sequential loop — no fancy parallelism here;
+        correctness > speed when the house is on fire.
         """
-        self.state.add_log("CRITICAL", "RMS",
-                           "🚨🚨🚨 PANIC EXIT INITIATED 🚨🚨🚨")
+        self.state.panic_triggered = True
+        self.state.add_log("CRIT", "RMS", "🚨 PANIC EXIT TRIGGERED 🚨")
+        LOG.critical("PANIC EXIT TRIGGERED")
 
-        positions = self.db.get_open_positions()
-        if not positions:
-            self.state.add_log("INFO", "RMS", "No open positions to close")
-            return
+        for strategy in strategies:
+            if strategy.status not in (StrategyStatus.ACTIVE, StrategyStatus.PARTIAL_EXIT,
+                                       StrategyStatus.DEPLOYING):
+                continue
+            for leg in strategy.legs:
+                if leg.status not in (LegStatus.ACTIVE, LegStatus.ENTERING):
+                    continue
+                self.state.add_log("CRIT", "RMS",
+                                   f"Panic closing: {leg.stock_code} {leg.strike_price}"
+                                   f"{leg.right.value[0].upper()}")
+                try:
+                    success = self.order_mgr.execute_buy_market(leg)
+                    if success:
+                        leg.status = LegStatus.SQUARED_OFF
+                        self.state.add_log("INFO", "RMS",
+                                           f"Panic close OK: {leg.leg_id}")
+                    else:
+                        leg.status = LegStatus.ERROR
+                        self.state.add_log("ERROR", "RMS",
+                                           f"Panic close FAILED: {leg.leg_id}")
+                except Exception as e:
+                    leg.status = LegStatus.ERROR
+                    self.state.add_log("ERROR", "RMS",
+                                       f"Panic exception: {leg.leg_id}: {e}")
+                    LOG.exception(f"Panic close exception for {leg.leg_id}")
+                self.db.save_leg(leg)
 
-        threads = []
-        for pos in positions:
-            def _exit(p=pos):
-                qty = abs(p["quantity"])
-                result = self.executor.square_off_position(
-                    strategy_id=p["strategy_id"],
-                    stock_code=p["stock_code"],
-                    strike_price=p["strike_price"],
-                    right=p["right_type"],
-                    expiry_date=p["expiry_date"],
-                    quantity=qty,
-                    leg_tag="panic_exit",
-                    use_market=True,
-                )
-                if result.success:
-                    pnl = (p["entry_price"] - result.filled_price) * qty
-                    self.db.update_position(
-                        p["id"],
-                        status="closed",
-                        current_price=result.filled_price,
-                        pnl=round(pnl, 2),
+            strategy.status = StrategyStatus.CLOSED
+            strategy.compute_total_pnl()
+            self.db.save_strategy(strategy)
+
+        self.state.add_log("CRIT", "RMS", "Panic exit complete")
+        LOG.critical("Panic exit complete")
+
+    def update_greeks(self, strategies: List[Strategy], spot: float):
+        """Refresh Greeks for all active legs using local BS engine."""
+        from greeks_engine import BlackScholes, compute_time_to_expiry
+        r = Config.RISK_FREE_RATE
+
+        for strategy in strategies:
+            for leg in strategy.legs:
+                if leg.status != LegStatus.ACTIVE:
+                    continue
+                if leg.current_price <= 0 or spot <= 0:
+                    continue
+                T = compute_time_to_expiry(leg.expiry_date)
+                try:
+                    iv = BlackScholes.implied_vol(
+                        leg.current_price, spot, leg.strike_price, T, r, leg.right
                     )
-                    self.state.add_log(
-                        "INFO", "RMS",
-                        f"Panic exit filled: {p['strike_price']}"
-                        f"{p['right_type'][0].upper()}E @{result.filled_price}",
+                    leg.greeks = BlackScholes.greeks(
+                        spot, leg.strike_price, T, r, iv, leg.right
                     )
-                else:
-                    self.state.add_log(
-                        "ERROR", "RMS",
-                        f"Panic exit FAILED for {p['strike_price']}"
-                        f"{p['right_type'][0].upper()}E: {result.error}",
-                    )
-
-            t = threading.Thread(target=_exit, daemon=True,
-                                 name=f"Panic-{pos['id']}")
-            threads.append(t)
-            t.start()
-
-        for t in threads:
-            t.join(timeout=30)
-
-        # Mark all strategies as closed
-        for strat in self.db.get_active_strategies():
-            self.db.update_strategy(strat["id"], status="closed")
-            self.state.set_strategy(strat["id"],
-                                    self.db.get_strategy(strat["id"]))
-
-        self.state.add_log("CRITICAL", "RMS",
-                           "🚨 PANIC EXIT COMPLETE 🚨")
-
-    def panic_exit(self):
-        """Public method to trigger kill switch from UI."""
-        self.state.activate_kill_switch()
+                except Exception as e:
+                    LOG.debug(f"Greek calc error for {leg.leg_id}: {e}")
