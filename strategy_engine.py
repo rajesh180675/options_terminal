@@ -1,409 +1,334 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: strategy_engine.py
+# ═══════════════════════════════════════════════════════════════
 """
-strategy_engine.py — Autonomous option-selling strategy engine.
-Supports Short Straddle and Short Strangle with delta-based strike selection.
+Strategy deployment engine.
+  • Short Straddle: sells ATM CE + PE
+  • Short Strangle: sells OTM CE + PE targeting a specific delta
 """
 
-from __future__ import annotations
+from datetime import datetime
+from typing import Optional, Tuple, List
 
-import threading
-import time
-from dataclasses import dataclass
-from typing import Literal
-
-from config import CFG, INSTRUMENTS
-from connection_manager import ConnectionManager
-from database import TradingDB
-from execution_engine import ExecutionEngine, OrderResult
-from greeks_engine import GreeksEngine
-from shared_state import SharedState, GreeksData
-
-
-@dataclass
-class StrategyParams:
-    instrument: str = "NIFTY"       # NIFTY, BANKNIFTY
-    strategy_type: str = "strangle" # "straddle" or "strangle"
-    target_delta: float = 0.15      # for strangle
-    lots: int = 1
-    sl_multiplier: float = 2.0     # SL = entry_price * sl_multiplier
-    expiry_date: str = ""           # ISO format
+from models import (
+    Strategy, Leg, StrategyType, StrategyStatus,
+    LegStatus, OrderSide, OptionRight, Greeks,
+)
+from greeks_engine import BlackScholes, compute_time_to_expiry
+from connection_manager import SessionManager
+from order_manager import OrderManager
+from database import Database
+from shared_state import SharedState
+from config import Config
+from utils import LOG, atm_strike, breeze_date, next_weekly_expiry, safe_float
 
 
 class StrategyEngine:
-    """
-    Deploys and manages option selling strategies.
-    """
+    """Autonomous strategy deployer."""
 
-    def __init__(self, conn: ConnectionManager, db: TradingDB,
-                 state: SharedState, executor: ExecutionEngine):
-        self.conn = conn
+    def __init__(
+        self,
+        session: SessionManager,
+        order_mgr: OrderManager,
+        db: Database,
+        state: SharedState,
+    ):
+        self.session = session
+        self.order_mgr = order_mgr
         self.db = db
         self.state = state
-        self.executor = executor
-        self.greeks = GreeksEngine(CFG.risk_free_rate)
-        self._lock = threading.Lock()
 
-    # ------------------------------------------------------- deploy
-    def deploy_strategy(self, params: StrategyParams) -> str | None:
-        """
-        Main entry point: analyse the option chain, select strikes,
-        and execute the strategy.
-        Returns strategy_id on success, None on failure.
-        """
-        instrument = CFG.get_instrument(params.instrument)
-        stock_code = instrument.stock_code
-        lot_size = instrument.lot_size
-        quantity = lot_size * params.lots
+    # ── Public deployment methods ────────────────────────────
 
-        self.state.add_log("INFO", "Strategy",
-                           f"Deploying {params.strategy_type} on "
-                           f"{params.instrument} ({params.lots} lots)")
+    def deploy_short_straddle(
+        self,
+        stock_code: str = "NIFTY",
+        expiry_date: str = "",
+        lots: int = 1,
+        sl_percentage: float = 0.0,
+    ) -> Optional[Strategy]:
+        """Sell ATM CE + ATM PE."""
+        if not expiry_date:
+            expiry_date = breeze_date(next_weekly_expiry(stock_code))
 
-        # 1. Get spot price
-        spot = self.state.get_spot(stock_code)
+        spot = self.session.get_spot_price(stock_code)
         if spot <= 0:
-            spot = self.conn.get_spot_quote(stock_code)
-            if spot <= 0:
-                self.state.add_log("ERROR", "Strategy",
-                                   "Cannot determine spot price")
-                return None
-            self.state.set_spot(stock_code, spot)
-
-        self.state.add_log("INFO", "Strategy", f"Spot price: {spot}")
-
-        # 2. Fetch option chain
-        chain = self.conn.get_option_chain(stock_code, params.expiry_date)
-        if not chain:
-            self.state.add_log("ERROR", "Strategy",
-                               "Empty option chain received")
+            self.state.add_log("ERROR", "Strategy", "Cannot get spot price")
             return None
 
-        # 3. Parse chain into strike -> price mapping
-        ce_prices: dict[float, float] = {}
-        pe_prices: dict[float, float] = {}
-        strikes: set[float] = set()
+        gap = Config.strike_gap(stock_code)
+        atm = atm_strike(spot, gap)
+        lot_size = Config.lot_size(stock_code)
+        quantity = lot_size * lots
+        sl_pct = sl_percentage if sl_percentage > 0 else Config.SL_PERCENTAGE
 
-        for rec in chain:
-            try:
-                strike = float(rec.get("strike_price", 0))
-                ltp = float(rec.get("ltp", 0))
-                right = rec.get("right", "").lower()
-                strikes.add(strike)
-                if "call" in right:
-                    ce_prices[strike] = ltp
-                elif "put" in right:
-                    pe_prices[strike] = ltp
-            except (ValueError, TypeError):
-                continue
-
-        sorted_strikes = sorted(strikes)
-        if not sorted_strikes:
-            self.state.add_log("ERROR", "Strategy", "No valid strikes found")
-            return None
-
-        tte = self.greeks.time_to_expiry_years(params.expiry_date)
         self.state.add_log("INFO", "Strategy",
-                           f"TTE: {tte * 365.25:.2f} days, "
-                           f"Strikes: {len(sorted_strikes)}")
+                           f"Deploying SHORT STRADDLE: {stock_code} ATM={atm} "
+                           f"qty={quantity} expiry={expiry_date[:10]}")
 
-        # 4. Select strikes based on strategy type
-        if params.strategy_type == "straddle":
-            ce_strike, pe_strike = self._select_straddle_strikes(
-                spot, sorted_strikes, instrument.strike_gap
-            )
-        else:
-            ce_strike, pe_strike = self._select_strangle_strikes(
-                spot, sorted_strikes, tte, ce_prices, pe_prices,
-                params.target_delta
-            )
-
-        self.state.add_log(
-            "INFO", "Strategy",
-            f"Selected: CE {ce_strike} / PE {pe_strike}"
-        )
-
-        # 5. Get entry prices
-        ce_price = ce_prices.get(ce_strike, 0)
-        pe_price = pe_prices.get(pe_strike, 0)
-        if ce_price <= 0 or pe_price <= 0:
-            self.state.add_log("ERROR", "Strategy",
-                               f"Invalid prices: CE={ce_price}, PE={pe_price}")
-            return None
-
-        # 6. Compute Greeks for selected strikes
-        ce_greeks = self.greeks.compute_for_strike(
-            spot, ce_strike, tte, ce_price, "call"
-        )
-        pe_greeks = self.greeks.compute_for_strike(
-            spot, pe_strike, tte, pe_price, "put"
-        )
-        self.state.add_log(
-            "INFO", "Strategy",
-            f"CE Greeks: Δ={ce_greeks.delta:.4f} IV={ce_greeks.iv:.2%} "
-            f"Θ={ce_greeks.theta:.2f} | "
-            f"PE Greeks: Δ={pe_greeks.delta:.4f} IV={pe_greeks.iv:.2%} "
-            f"Θ={pe_greeks.theta:.2f}"
-        )
-
-        # 7. Create strategy in DB
-        sid = self.db.create_strategy(
-            name=params.strategy_type,
+        strategy = Strategy(
+            strategy_type=StrategyType.SHORT_STRADDLE,
             stock_code=stock_code,
-            target_delta=params.target_delta,
-            ce_strike=ce_strike,
-            pe_strike=pe_strike,
-            expiry_date=params.expiry_date,
-            lots=params.lots,
+            target_delta=0.5,
+            status=StrategyStatus.DEPLOYING,
         )
-        self.db.update_strategy(sid, status="entering")
-        self.state.set_strategy(sid, self.db.get_strategy(sid))
 
-        # 8. Subscribe to feeds for both legs
-        self.conn.subscribe(stock_code, params.expiry_date, ce_strike, "call")
-        self.conn.subscribe(stock_code, params.expiry_date, pe_strike, "put")
-        time.sleep(0.5)  # let first ticks arrive
+        # CE Leg
+        ce_leg = Leg(
+            strategy_id=strategy.strategy_id,
+            stock_code=stock_code,
+            strike_price=atm,
+            right=OptionRight.CALL,
+            expiry_date=expiry_date,
+            side=OrderSide.SELL,
+            quantity=quantity,
+            sl_percentage=sl_pct,
+            status=LegStatus.ENTERING,
+        )
 
-        # 9. Execute both legs (near-simultaneously via threads)
-        ce_result: OrderResult | None = None
-        pe_result: OrderResult | None = None
+        # PE Leg
+        pe_leg = Leg(
+            strategy_id=strategy.strategy_id,
+            stock_code=stock_code,
+            strike_price=atm,
+            right=OptionRight.PUT,
+            expiry_date=expiry_date,
+            side=OrderSide.SELL,
+            quantity=quantity,
+            sl_percentage=sl_pct,
+            status=LegStatus.ENTERING,
+        )
 
-        def _exec_ce():
-            nonlocal ce_result
-            ce_result = self.executor.execute_with_chase(
-                strategy_id=sid,
-                stock_code=stock_code,
-                action="sell",
-                strike_price=ce_strike,
-                right="call",
-                expiry_date=params.expiry_date,
-                quantity=quantity,
-                initial_price=ce_price,
-                leg_tag="ce_entry",
-            )
+        strategy.legs = [ce_leg, pe_leg]
+        self.db.save_strategy(strategy)
+        self.db.save_leg(ce_leg)
+        self.db.save_leg(pe_leg)
 
-        def _exec_pe():
-            nonlocal pe_result
-            pe_result = self.executor.execute_with_chase(
-                strategy_id=sid,
-                stock_code=stock_code,
-                action="sell",
-                strike_price=pe_strike,
-                right="put",
-                expiry_date=params.expiry_date,
-                quantity=quantity,
-                initial_price=pe_price,
-                leg_tag="pe_entry",
-            )
+        # Subscribe to feeds for both legs
+        self.session.subscribe_option(stock_code, atm, "call", expiry_date)
+        self.session.subscribe_option(stock_code, atm, "put", expiry_date)
+        import time; time.sleep(0.5)  # Brief pause to receive initial ticks
 
-        t_ce = threading.Thread(target=_exec_ce, name=f"Exec-CE-{sid}")
-        t_pe = threading.Thread(target=_exec_pe, name=f"Exec-PE-{sid}")
-        t_ce.start()
-        t_pe.start()
-        t_ce.join(timeout=60)
-        t_pe.join(timeout=60)
+        # Execute both legs
+        success_ce = self.order_mgr.execute_sell_with_chase(ce_leg)
+        success_pe = self.order_mgr.execute_sell_with_chase(pe_leg)
 
-        # 10. Evaluate results
-        ce_ok = ce_result and ce_result.success
-        pe_ok = pe_result and pe_result.success
-
-        if ce_ok and pe_ok:
-            ce_fill = ce_result.filled_price
-            pe_fill = pe_result.filled_price
-            total_premium = (ce_fill + pe_fill) * quantity
-
-            ce_sl = round(ce_fill * params.sl_multiplier, 2)
-            pe_sl = round(pe_fill * params.sl_multiplier, 2)
-
-            self.db.update_strategy(
-                sid,
-                status="active",
-                ce_entry_price=ce_fill,
-                pe_entry_price=pe_fill,
-                ce_sl_price=ce_sl,
-                pe_sl_price=pe_sl,
-                total_premium=total_premium,
-            )
-
-            # Create position records
-            self.db.create_position(
-                strategy_id=sid, stock_code=stock_code,
-                strike_price=ce_strike, right_type="call",
-                expiry_date=params.expiry_date,
-                quantity=-quantity,  # short
-                entry_price=ce_fill, sl_price=ce_sl,
-            )
-            self.db.create_position(
-                strategy_id=sid, stock_code=stock_code,
-                strike_price=pe_strike, right_type="put",
-                expiry_date=params.expiry_date,
-                quantity=-quantity,
-                entry_price=pe_fill, sl_price=pe_sl,
-            )
-
-            self.state.set_strategy(sid, self.db.get_strategy(sid))
-            self.state.add_log(
-                "INFO", "Strategy",
-                f"✅ Strategy {sid} ACTIVE | Premium: ₹{total_premium:,.0f} | "
-                f"CE {ce_strike}@{ce_fill} SL={ce_sl} | "
-                f"PE {pe_strike}@{pe_fill} SL={pe_sl}",
-            )
-            self.db.log("INFO", "Strategy", f"Strategy {sid} deployed",
-                        {"ce_strike": ce_strike, "pe_strike": pe_strike,
-                         "ce_fill": ce_fill, "pe_fill": pe_fill})
-            return sid
-
+        if success_ce and success_pe:
+            strategy.status = StrategyStatus.ACTIVE
+            self.state.add_log("INFO", "Strategy", "Short Straddle ACTIVE")
+        elif success_ce or success_pe:
+            strategy.status = StrategyStatus.ACTIVE  # partial but active
+            self.state.add_log("WARN", "Strategy",
+                               "Short Straddle partially filled")
         else:
-            # One or both legs failed — attempt cleanup
-            self.state.add_log(
-                "ERROR", "Strategy",
-                f"Leg failure: CE={'OK' if ce_ok else 'FAIL'}, "
-                f"PE={'OK' if pe_ok else 'FAIL'}. Cleaning up...",
-            )
-            self._cleanup_partial(sid, stock_code, params.expiry_date,
-                                  quantity, ce_strike, pe_strike,
-                                  ce_result, pe_result)
-            self.db.update_strategy(sid, status="error")
-            self.state.set_strategy(sid, self.db.get_strategy(sid))
+            strategy.status = StrategyStatus.ERROR
+            self.state.add_log("ERROR", "Strategy", "Short Straddle FAILED")
+
+        self.db.save_strategy(strategy)
+        return strategy
+
+    def deploy_short_strangle(
+        self,
+        stock_code: str = "NIFTY",
+        target_delta: float = 0.15,
+        expiry_date: str = "",
+        lots: int = 1,
+        sl_percentage: float = 0.0,
+    ) -> Optional[Strategy]:
+        """Sell OTM CE + OTM PE at the specified delta level."""
+        if not expiry_date:
+            expiry_date = breeze_date(next_weekly_expiry(stock_code))
+
+        spot = self.session.get_spot_price(stock_code)
+        if spot <= 0:
+            self.state.add_log("ERROR", "Strategy", "Cannot get spot price")
             return None
 
-    # ------------------------------------------------ strike selection
-    def _select_straddle_strikes(
-        self, spot: float, strikes: list[float], gap: int
-    ) -> tuple[float, float]:
-        """
-        ATM straddle: pick the strike closest to spot (±5 point buffer).
-        Both CE and PE use the same strike.
-        """
-        atm = min(strikes, key=lambda s: abs(s - spot))
-        # Apply ±5 point buffer: if spot is very close to a strike,
-        # use that strike; otherwise still use closest
-        if abs(atm - spot) > gap * 0.1:
-            # Check next strike
-            idx = strikes.index(atm)
-            candidates = strikes[max(0, idx - 1):idx + 2]
-            atm = min(candidates, key=lambda s: abs(s - spot))
-        return atm, atm
+        self.state.add_log("INFO", "Strategy",
+                           f"Scanning chain for {target_delta:.2f}Δ strangle…")
 
-    def _select_strangle_strikes(
-        self,
-        spot: float,
-        strikes: list[float],
-        tte: float,
-        ce_prices: dict[float, float],
-        pe_prices: dict[float, float],
-        target_delta: float,
-    ) -> tuple[float, float]:
-        """
-        Select OTM call and put strikes closest to target delta.
-        """
-        atm = min(strikes, key=lambda s: abs(s - spot))
-        atm_idx = strikes.index(atm)
-
-        # CE: strikes above ATM (OTM calls)
-        otm_calls = [s for s in strikes if s >= atm]
-        ce_strike = self.greeks.find_strike_by_delta(
-            spot, otm_calls, tte, ce_prices, target_delta, "call"
+        # Find the best strikes via option chain + local Greeks
+        ce_strike, pe_strike = self._find_delta_strikes(
+            stock_code, spot, expiry_date, target_delta
         )
 
-        # PE: strikes below ATM (OTM puts)
-        otm_puts = [s for s in strikes if s <= atm]
-        pe_strike = self.greeks.find_strike_by_delta(
-            spot, otm_puts, tte, pe_prices, target_delta, "put"
+        if ce_strike is None or pe_strike is None:
+            self.state.add_log("ERROR", "Strategy", "Could not find delta strikes")
+            return None
+
+        lot_size = Config.lot_size(stock_code)
+        quantity = lot_size * lots
+        sl_pct = sl_percentage if sl_percentage > 0 else Config.SL_PERCENTAGE
+
+        self.state.add_log("INFO", "Strategy",
+                           f"Deploying SHORT STRANGLE: CE={ce_strike} PE={pe_strike} "
+                           f"target_delta={target_delta}")
+
+        strategy = Strategy(
+            strategy_type=StrategyType.SHORT_STRANGLE,
+            stock_code=stock_code,
+            target_delta=target_delta,
+            status=StrategyStatus.DEPLOYING,
         )
 
-        return ce_strike, pe_strike
+        ce_leg = Leg(
+            strategy_id=strategy.strategy_id,
+            stock_code=stock_code,
+            strike_price=ce_strike,
+            right=OptionRight.CALL,
+            expiry_date=expiry_date,
+            side=OrderSide.SELL,
+            quantity=quantity,
+            sl_percentage=sl_pct,
+            status=LegStatus.ENTERING,
+        )
 
-    # -------------------------------------------------- cleanup
-    def _cleanup_partial(
+        pe_leg = Leg(
+            strategy_id=strategy.strategy_id,
+            stock_code=stock_code,
+            strike_price=pe_strike,
+            right=OptionRight.PUT,
+            expiry_date=expiry_date,
+            side=OrderSide.SELL,
+            quantity=quantity,
+            sl_percentage=sl_pct,
+            status=LegStatus.ENTERING,
+        )
+
+        strategy.legs = [ce_leg, pe_leg]
+        self.db.save_strategy(strategy)
+        self.db.save_leg(ce_leg)
+        self.db.save_leg(pe_leg)
+
+        # Subscribe to feeds
+        self.session.subscribe_option(stock_code, ce_strike, "call", expiry_date)
+        self.session.subscribe_option(stock_code, pe_strike, "put", expiry_date)
+        import time; time.sleep(0.5)
+
+        # Execute
+        success_ce = self.order_mgr.execute_sell_with_chase(ce_leg)
+        success_pe = self.order_mgr.execute_sell_with_chase(pe_leg)
+
+        if success_ce and success_pe:
+            strategy.status = StrategyStatus.ACTIVE
+        elif success_ce or success_pe:
+            strategy.status = StrategyStatus.ACTIVE
+        else:
+            strategy.status = StrategyStatus.ERROR
+
+        self.db.save_strategy(strategy)
+        return strategy
+
+    # ── Strike selection via Greeks ──────────────────────────
+
+    def _find_delta_strikes(
         self,
-        sid: str,
         stock_code: str,
+        spot: float,
         expiry_date: str,
-        quantity: int,
-        ce_strike: float,
-        pe_strike: float,
-        ce_result: OrderResult | None,
-        pe_result: OrderResult | None,
-    ):
-        """If one leg filled but the other didn't, square off the filled leg."""
-        if ce_result and ce_result.success:
-            self.state.add_log("WARN", "Strategy",
-                               f"Squaring off CE leg of failed strategy {sid}")
-            self.executor.square_off_position(
-                strategy_id=sid, stock_code=stock_code,
-                strike_price=ce_strike, right="call",
-                expiry_date=expiry_date, quantity=quantity,
-                leg_tag="cleanup", use_market=True,
-            )
-        if pe_result and pe_result.success:
-            self.state.add_log("WARN", "Strategy",
-                               f"Squaring off PE leg of failed strategy {sid}")
-            self.executor.square_off_position(
-                strategy_id=sid, stock_code=stock_code,
-                strike_price=pe_strike, right="put",
-                expiry_date=expiry_date, quantity=quantity,
-                leg_tag="cleanup", use_market=True,
-            )
+        target_delta: float,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Scan the option chain, compute local BS delta for each strike,
+        and return (CE_strike, PE_strike) closest to ±target_delta.
+        """
+        result = self.session.get_option_chain(stock_code, expiry_date, "others")
+        if not result or result.get("Status") != 200 or not result.get("Success"):
+            LOG.error("Option chain fetch failed")
+            return None, None
 
-    # ------------------------------------------------ exit strategy
-    def exit_strategy(self, sid: str, use_market: bool = False):
-        """Exit all legs of a strategy."""
-        strat = self.db.get_strategy(sid)
-        if not strat:
-            self.state.add_log("ERROR", "Strategy",
-                               f"Strategy {sid} not found")
-            return
+        chain = result["Success"]
+        T = compute_time_to_expiry(expiry_date)
+        r = Config.RISK_FREE_RATE
 
-        positions = self.db.get_positions_for_strategy(sid)
-        instrument = None
-        for name, spec in INSTRUMENTS.items():
-            if spec.stock_code == strat["stock_code"]:
-                instrument = spec
-                break
-        if not instrument:
-            self.state.add_log("ERROR", "Strategy",
-                               f"Unknown instrument: {strat['stock_code']}")
-            return
+        best_ce_strike = None
+        best_ce_delta_diff = float("inf")
+        best_pe_strike = None
+        best_pe_delta_diff = float("inf")
 
-        self.db.update_strategy(sid, status="exiting")
-        self.state.add_log("INFO", "Strategy",
-                           f"Exiting strategy {sid}")
+        for item in chain:
+            strike = safe_float(item.get("strike_price", 0))
+            right_str = item.get("right", "").lower()
+            ltp = safe_float(item.get("ltp", 0))
 
-        for pos in positions:
-            if pos["status"] != "open":
+            if strike <= 0 or ltp <= 0:
                 continue
-            qty = abs(pos["quantity"])
-            result = self.executor.square_off_position(
-                strategy_id=sid,
-                stock_code=pos["stock_code"],
-                strike_price=pos["strike_price"],
-                right=pos["right_type"],
-                expiry_date=pos["expiry_date"],
-                quantity=qty,
-                leg_tag="exit",
-                use_market=use_market,
-            )
-            if result.success:
-                pnl = (pos["entry_price"] - result.filled_price) * qty
-                self.db.update_position(
-                    pos["id"],
-                    status="closed",
-                    current_price=result.filled_price,
-                    pnl=pnl,
-                )
-                self.state.add_log(
-                    "INFO", "Strategy",
-                    f"Leg closed: {pos['strike_price']}"
-                    f"{pos['right_type'][0].upper()}E "
-                    f"@{result.filled_price} PnL=₹{pnl:,.0f}",
-                )
-            else:
-                self.state.add_log(
-                    "ERROR", "Strategy",
-                    f"Failed to exit leg: {pos['strike_price']}"
-                    f"{pos['right_type'][0].upper()}E — {result.error}",
-                )
 
-        self.db.update_strategy(sid, status="closed")
-        self.state.set_strategy(sid, self.db.get_strategy(sid))
-        self.state.add_log("INFO", "Strategy",
-                           f"Strategy {sid} fully closed")
+            if "call" in right_str:
+                right = OptionRight.CALL
+                # Compute IV then delta
+                iv = BlackScholes.implied_vol(ltp, spot, strike, T, r, right)
+                delta = abs(BlackScholes.delta(spot, strike, T, r, iv, right))
+                diff = abs(delta - target_delta)
+                if diff < best_ce_delta_diff and strike > spot:
+                    best_ce_delta_diff = diff
+                    best_ce_strike = strike
+            elif "put" in right_str:
+                right = OptionRight.PUT
+                iv = BlackScholes.implied_vol(ltp, spot, strike, T, r, right)
+                delta = abs(BlackScholes.delta(spot, strike, T, r, iv, right))
+                diff = abs(delta - target_delta)
+                if diff < best_pe_delta_diff and strike < spot:
+                    best_pe_delta_diff = diff
+                    best_pe_strike = strike
+
+        if best_ce_strike and best_pe_strike:
+            self.state.add_log("INFO", "Strategy",
+                               f"Delta scan: CE={best_ce_strike} (Δ diff={best_ce_delta_diff:.3f}), "
+                               f"PE={best_pe_strike} (Δ diff={best_pe_delta_diff:.3f})")
+        return best_ce_strike, best_pe_strike
+
+    # ── Chain snapshot (for UI) ──────────────────────────────
+
+    def get_option_chain_with_greeks(
+        self,
+        stock_code: str = "NIFTY",
+        expiry_date: str = "",
+    ) -> List[dict]:
+        """Return enriched option chain with locally computed Greeks."""
+        if not expiry_date:
+            expiry_date = breeze_date(next_weekly_expiry(stock_code))
+
+        spot = self.session.get_spot_price(stock_code)
+        result = self.session.get_option_chain(stock_code, expiry_date, "others")
+        if not result or not result.get("Success"):
+            return []
+
+        chain = result["Success"]
+        T = compute_time_to_expiry(expiry_date)
+        r = Config.RISK_FREE_RATE
+        enriched = []
+
+        for item in chain:
+            strike = safe_float(item.get("strike_price", 0))
+            right_str = item.get("right", "").lower()
+            ltp = safe_float(item.get("ltp", 0))
+
+            if strike <= 0:
+                continue
+
+            right = OptionRight.CALL if "call" in right_str else OptionRight.PUT
+
+            if ltp > 0 and T > 0:
+                iv = BlackScholes.implied_vol(ltp, spot, strike, T, r, right)
+                greeks = BlackScholes.greeks(spot, strike, T, r, iv, right)
+            else:
+                iv = 0.0
+                greeks = Greeks()
+
+            enriched.append({
+                "strike": strike,
+                "right": right_str.upper(),
+                "ltp": ltp,
+                "bid": safe_float(item.get("best_bid_price", 0)),
+                "ask": safe_float(item.get("best_offer_price", 0)),
+                "iv": round(iv * 100, 2),
+                "delta": round(greeks.delta, 4),
+                "gamma": round(greeks.gamma, 6),
+                "theta": round(greeks.theta, 2),
+                "vega": round(greeks.vega, 2),
+                "oi": safe_float(item.get("open_interest", 0)),
+                "volume": safe_float(item.get("volume", 0)),
+            })
+
+        return sorted(enriched, key=lambda x: (x["strike"], x["right"]))
