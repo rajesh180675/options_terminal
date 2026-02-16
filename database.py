@@ -2,14 +2,14 @@
 # FILE: database.py
 # ═══════════════════════════════════════════════════════════════
 """
-SQLite persistence layer.
-Tracks strategies, legs, and orders so the system can recover after a crash.
+SQLite persistence layer with schema versioning.
+Fixes: added migration support, proper thread-local connections.
 """
 
 import sqlite3
 import threading
 import json
-from typing import List, Optional
+from typing import List
 from datetime import datetime
 
 from models import (
@@ -17,11 +17,10 @@ from models import (
     LegStatus, OrderSide, OptionRight, Greeks,
 )
 from config import Config
-from utils import LOG
 
 
 class Database:
-    """Thread-safe SQLite wrapper with auto-schema migration."""
+    SCHEMA_VERSION = 2
 
     def __init__(self, db_path: str = Config.DB_PATH):
         self._db_path = db_path
@@ -32,7 +31,7 @@ class Database:
     def _conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
             self._local.conn = sqlite3.connect(
-                self._db_path, check_same_thread=False
+                self._db_path, check_same_thread=False, timeout=10.0
             )
             self._local.conn.row_factory = sqlite3.Row
             self._local.conn.execute("PRAGMA journal_mode=WAL")
@@ -41,8 +40,11 @@ class Database:
 
     def _init_schema(self):
         with self._conn:
-            self._conn.executescript(
-                """
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY
+                );
+
                 CREATE TABLE IF NOT EXISTS strategies (
                     strategy_id   TEXT PRIMARY KEY,
                     strategy_type TEXT NOT NULL,
@@ -91,30 +93,41 @@ class Database:
                     message     TEXT
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_legs_strategy
-                    ON legs(strategy_id);
-                CREATE INDEX IF NOT EXISTS idx_legs_status
-                    ON legs(status);
-                """
-            )
-        LOG.info("Database schema initialised")
+                CREATE INDEX IF NOT EXISTS idx_legs_strategy ON legs(strategy_id);
+                CREATE INDEX IF NOT EXISTS idx_legs_status ON legs(status);
+                CREATE INDEX IF NOT EXISTS idx_order_log_time ON order_log(timestamp);
+            """)
+
+            # Version tracking
+            row = self._conn.execute(
+                "SELECT MAX(version) as v FROM schema_version"
+            ).fetchone()
+            current = row["v"] if row and row["v"] else 0
+            if current < self.SCHEMA_VERSION:
+                self._migrate(current)
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
+                    (self.SCHEMA_VERSION,),
+                )
+
+    def _migrate(self, from_version: int):
+        """Run migrations sequentially."""
+        if from_version < 2:
+            # Add any new columns here in future
+            pass
 
     # ── Strategy CRUD ────────────────────────────────────────
 
     def save_strategy(self, s: Strategy):
         with self._conn:
             self._conn.execute(
-                """
-                INSERT OR REPLACE INTO strategies
-                    (strategy_id, strategy_type, stock_code, target_delta,
-                     total_pnl, status, created_at, closed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    s.strategy_id, s.strategy_type.value, s.stock_code,
-                    s.target_delta, s.total_pnl, s.status.value,
-                    s.created_at, s.closed_at,
-                ),
+                """INSERT OR REPLACE INTO strategies
+                   (strategy_id, strategy_type, stock_code, target_delta,
+                    total_pnl, status, created_at, closed_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (s.strategy_id, s.strategy_type.value, s.stock_code,
+                 s.target_delta, s.total_pnl, s.status.value,
+                 s.created_at, s.closed_at),
             )
 
     def update_strategy_status(self, sid: str, status: StrategyStatus, pnl: float = 0):
@@ -145,36 +158,48 @@ class Database:
             strategies.append(s)
         return strategies
 
+    def get_all_strategies(self) -> List[Strategy]:
+        rows = self._conn.execute("SELECT * FROM strategies ORDER BY created_at DESC").fetchall()
+        strategies = []
+        for r in rows:
+            s = Strategy(
+                strategy_id=r["strategy_id"],
+                strategy_type=StrategyType(r["strategy_type"]),
+                stock_code=r["stock_code"],
+                target_delta=r["target_delta"],
+                total_pnl=r["total_pnl"],
+                status=StrategyStatus(r["status"]),
+                created_at=r["created_at"],
+                closed_at=r["closed_at"],
+            )
+            s.legs = self.get_legs_for_strategy(s.strategy_id)
+            strategies.append(s)
+        return strategies
+
     # ── Leg CRUD ─────────────────────────────────────────────
 
     def save_leg(self, leg: Leg):
         greeks_json = json.dumps({
-            "delta": leg.greeks.delta,
-            "gamma": leg.greeks.gamma,
-            "theta": leg.greeks.theta,
-            "vega": leg.greeks.vega,
+            "delta": leg.greeks.delta, "gamma": leg.greeks.gamma,
+            "theta": leg.greeks.theta, "vega": leg.greeks.vega,
             "iv": leg.greeks.iv,
         })
         with self._conn:
             self._conn.execute(
-                """
-                INSERT OR REPLACE INTO legs
-                    (leg_id, strategy_id, stock_code, exchange_code,
-                     strike_price, right, expiry_date, side, quantity,
-                     entry_price, current_price, exit_price, sl_price,
-                     sl_percentage, entry_order_id, exit_order_id,
-                     status, entry_time, exit_time, pnl, greeks_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    leg.leg_id, leg.strategy_id, leg.stock_code,
-                    leg.exchange_code, leg.strike_price, leg.right.value,
-                    leg.expiry_date, leg.side.value, leg.quantity,
-                    leg.entry_price, leg.current_price, leg.exit_price,
-                    leg.sl_price, leg.sl_percentage, leg.entry_order_id,
-                    leg.exit_order_id, leg.status.value, leg.entry_time,
-                    leg.exit_time, leg.pnl, greeks_json,
-                ),
+                """INSERT OR REPLACE INTO legs
+                   (leg_id, strategy_id, stock_code, exchange_code,
+                    strike_price, right, expiry_date, side, quantity,
+                    entry_price, current_price, exit_price, sl_price,
+                    sl_percentage, entry_order_id, exit_order_id,
+                    status, entry_time, exit_time, pnl, greeks_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (leg.leg_id, leg.strategy_id, leg.stock_code,
+                 leg.exchange_code, leg.strike_price, leg.right.value,
+                 leg.expiry_date, leg.side.value, leg.quantity,
+                 leg.entry_price, leg.current_price, leg.exit_price,
+                 leg.sl_price, leg.sl_percentage, leg.entry_order_id,
+                 leg.exit_order_id, leg.status.value, leg.entry_time,
+                 leg.exit_time, leg.pnl, greeks_json),
             )
 
     def update_leg_price(self, leg_id: str, current_price: float, pnl: float):
@@ -200,67 +225,39 @@ class Database:
         rows = self._conn.execute(
             "SELECT * FROM legs WHERE strategy_id=?", (sid,)
         ).fetchall()
-        legs = []
-        for r in rows:
-            g = json.loads(r["greeks_json"] or "{}")
-            leg = Leg(
-                leg_id=r["leg_id"],
-                strategy_id=r["strategy_id"],
-                stock_code=r["stock_code"],
-                exchange_code=r["exchange_code"],
-                strike_price=r["strike_price"],
-                right=OptionRight(r["right"]),
-                expiry_date=r["expiry_date"],
-                side=OrderSide(r["side"]),
-                quantity=r["quantity"],
-                entry_price=r["entry_price"],
-                current_price=r["current_price"],
-                exit_price=r["exit_price"],
-                sl_price=r["sl_price"],
-                sl_percentage=r["sl_percentage"],
-                entry_order_id=r["entry_order_id"] or "",
-                exit_order_id=r["exit_order_id"] or "",
-                status=LegStatus(r["status"]),
-                entry_time=r["entry_time"],
-                exit_time=r["exit_time"],
-                pnl=r["pnl"],
-                greeks=Greeks(**g) if g else Greeks(),
-            )
-            legs.append(leg)
-        return legs
+        return [self._row_to_leg(r) for r in rows]
 
     def get_active_legs(self) -> List[Leg]:
         rows = self._conn.execute(
             "SELECT * FROM legs WHERE status IN ('active','entering','sl_triggered','exiting')"
         ).fetchall()
-        legs = []
-        for r in rows:
-            g = json.loads(r["greeks_json"] or "{}")
-            leg = Leg(
-                leg_id=r["leg_id"],
-                strategy_id=r["strategy_id"],
-                stock_code=r["stock_code"],
-                exchange_code=r["exchange_code"],
-                strike_price=r["strike_price"],
-                right=OptionRight(r["right"]),
-                expiry_date=r["expiry_date"],
-                side=OrderSide(r["side"]),
-                quantity=r["quantity"],
-                entry_price=r["entry_price"],
-                current_price=r["current_price"],
-                exit_price=r["exit_price"],
-                sl_price=r["sl_price"],
-                sl_percentage=r["sl_percentage"],
-                entry_order_id=r["entry_order_id"] or "",
-                exit_order_id=r["exit_order_id"] or "",
-                status=LegStatus(r["status"]),
-                entry_time=r["entry_time"],
-                exit_time=r["exit_time"],
-                pnl=r["pnl"],
-                greeks=Greeks(**g) if g else Greeks(),
-            )
-            legs.append(leg)
-        return legs
+        return [self._row_to_leg(r) for r in rows]
+
+    def _row_to_leg(self, r) -> Leg:
+        g = json.loads(r["greeks_json"] or "{}")
+        return Leg(
+            leg_id=r["leg_id"],
+            strategy_id=r["strategy_id"],
+            stock_code=r["stock_code"],
+            exchange_code=r["exchange_code"],
+            strike_price=r["strike_price"],
+            right=OptionRight(r["right"]),
+            expiry_date=r["expiry_date"],
+            side=OrderSide(r["side"]),
+            quantity=r["quantity"],
+            entry_price=r["entry_price"],
+            current_price=r["current_price"],
+            exit_price=r["exit_price"],
+            sl_price=r["sl_price"],
+            sl_percentage=r["sl_percentage"],
+            entry_order_id=r["entry_order_id"] or "",
+            exit_order_id=r["exit_order_id"] or "",
+            status=LegStatus(r["status"]),
+            entry_time=r["entry_time"],
+            exit_time=r["exit_time"],
+            pnl=r["pnl"],
+            greeks=Greeks(**g) if g else Greeks(),
+        )
 
     # ── Order log ────────────────────────────────────────────
 
@@ -268,15 +265,11 @@ class Database:
                   status: str, price: float, quantity: int, message: str = ""):
         with self._conn:
             self._conn.execute(
-                """
-                INSERT INTO order_log (timestamp, leg_id, order_id, action,
-                                       status, price, quantity, message)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                (
-                    datetime.now().isoformat(), leg_id, order_id,
-                    action, status, price, quantity, message,
-                ),
+                """INSERT INTO order_log
+                   (timestamp, leg_id, order_id, action, status, price, quantity, message)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (datetime.now().isoformat(), leg_id, order_id,
+                 action, status, price, quantity, message),
             )
 
     def get_recent_order_logs(self, limit: int = 50) -> list:
