@@ -1,71 +1,69 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: config.py
+# ═══════════════════════════════════════════════════════════════
 """
-config.py — Centralised configuration loaded from .env and sensible defaults.
+Central configuration loaded from environment variables.
+Every tunable constant lives here.
 """
-
-from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env")
 
 
-@dataclass(frozen=True)
-class InstrumentSpec:
-    stock_code: str
-    exchange_code: str
-    lot_size: int
-    tick_size: float
-    strike_gap: int
+class Config:
+    # ── Breeze credentials ──────────────────────────────────
+    API_KEY: str = os.getenv("BREEZE_API_KEY", "")
+    API_SECRET: str = os.getenv("BREEZE_API_SECRET", "")
+    SESSION_TOKEN: str = os.getenv("BREEZE_SESSION_TOKEN", "")
+    TRADING_MODE: str = os.getenv("TRADING_MODE", "mock")  # 'mock' | 'live'
 
+    # ── Market parameters ───────────────────────────────────
+    RISK_FREE_RATE: float = float(os.getenv("RISK_FREE_RATE", "0.07"))
+    DEFAULT_STOCK: str = os.getenv("DEFAULT_STOCK", "NIFTY")
 
-INSTRUMENTS: dict[str, InstrumentSpec] = {
-    "NIFTY": InstrumentSpec("NIFTY", "NFO", 65, 0.05, 50),
-    "BANKNIFTY": InstrumentSpec("CNXBAN", "NFO", 15, 0.05, 100),
-    "FINNIFTY": InstrumentSpec("NIFFIN", "NFO", 25, 0.05, 50),
-    "SENSEX": InstrumentSpec("BSESEN", "BFO", 20, 0.05, 100),
-}
+    LOT_SIZES: dict = {
+        "NIFTY": int(os.getenv("NIFTY_LOT_SIZE", "65")),
+        "CNXBAN": int(os.getenv("BANKNIFTY_LOT_SIZE", "15")),
+        "BANKNIFTY": int(os.getenv("BANKNIFTY_LOT_SIZE", "15")),
+    }
 
+    STRIKE_GAPS: dict = {
+        "NIFTY": 50,
+        "CNXBAN": 100,
+        "BANKNIFTY": 100,
+    }
 
-@dataclass
-class AppConfig:
-    # --- Breeze credentials ---
-    api_key: str = os.getenv("BREEZE_API_KEY", "")
-    api_secret: str = os.getenv("BREEZE_API_SECRET", "")
-    session_token: str = os.getenv("BREEZE_SESSION_TOKEN", "")
-    totp_secret: str = os.getenv("BREEZE_TOTP_SECRET", "")
+    # ── Risk limits ─────────────────────────────────────────
+    MAX_LOSS_PER_STRATEGY: float = float(os.getenv("MAX_LOSS_PER_STRATEGY", "-5000"))
+    GLOBAL_MAX_LOSS: float = float(os.getenv("GLOBAL_MAX_LOSS", "-15000"))
+    SL_PERCENTAGE: float = float(os.getenv("SL_PERCENTAGE", "50"))
 
-    # --- Runtime ---
-    trading_mode: str = os.getenv("TRADING_MODE", "mock")  # "mock" or "live"
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
-    db_path: str = os.getenv("DB_PATH", "trading.db")
+    # ── Execution ───────────────────────────────────────────
+    CHASE_TIMEOUT: float = float(os.getenv("CHASE_TIMEOUT_SECONDS", "3"))
+    CHASE_MAX_RETRIES: int = int(os.getenv("CHASE_MAX_RETRIES", "5"))
 
-    # --- Greeks ---
-    risk_free_rate: float = float(os.getenv("RISK_FREE_RATE", "0.07"))
+    # ── Rate limiting ───────────────────────────────────────
+    API_RATE_LIMIT: int = int(os.getenv("API_RATE_LIMIT", "90"))
 
-    # --- Risk ---
-    default_sl_multiplier: float = float(os.getenv("DEFAULT_SL_MULTIPLIER", "2.0"))
-    max_loss_per_strategy: float = float(os.getenv("MAX_LOSS_PER_STRATEGY", "50000"))
-    global_max_loss: float = float(os.getenv("GLOBAL_MAX_LOSS", "200000"))
+    # ── Persistence ─────────────────────────────────────────
+    DB_PATH: str = os.getenv("DB_PATH", "trading.db")
+    SESSION_CACHE_FILE: str = ".breeze_session_cache"
 
-    # --- Execution ---
-    chase_timeout_seconds: float = float(os.getenv("CHASE_TIMEOUT_SECONDS", "3"))
-    chase_max_retries: int = int(os.getenv("CHASE_MAX_RETRIES", "5"))
+    # ── Monitoring ──────────────────────────────────────────
+    MONITOR_INTERVAL: float = float(os.getenv("MONITOR_INTERVAL", "0.5"))
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
-    # --- Rate limiting ---
-    api_rate_limit: int = 100
-    api_rate_period: int = 60  # seconds
+    # ── Latency circuit breaker ─────────────────────────────
+    MAX_API_LATENCY_MS: int = int(os.getenv("MAX_API_LATENCY_MS", "2000"))
+    MAX_SLIPPAGE_PCT: float = float(os.getenv("MAX_SLIPPAGE_PCT", "5.0"))
 
-    # --- Session cache ---
-    session_cache_path: str = ".session_cache"
+    @classmethod
+    def lot_size(cls, stock_code: str) -> int:
+        return cls.LOT_SIZES.get(stock_code.upper(), 25)
 
-    def get_instrument(self, name: str) -> InstrumentSpec:
-        name_upper = name.upper().replace(" ", "")
-        if name_upper in INSTRUMENTS:
-            return INSTRUMENTS[name_upper]
-        raise ValueError(f"Unknown instrument: {name}. Available: {list(INSTRUMENTS)}")
-
-
-CFG = AppConfig()
+    @classmethod
+    def strike_gap(cls, stock_code: str) -> int:
+        return cls.STRIKE_GAPS.get(stock_code.upper(), 50)
