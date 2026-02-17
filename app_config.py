@@ -78,15 +78,17 @@ class Config:
     MONITOR_INTERVAL: float = float(_get("MONITOR_INTERVAL", "0.5"))
     LOG_LEVEL: str = _get("LOG_LEVEL", "INFO")
     WS_HEARTBEAT_TIMEOUT: float = float(_get("WS_HEARTBEAT_TIMEOUT", "30"))
-    MARGIN_BUFFER_PCT: float = float(_get("MARGIN_BUFFER_PCT", "10"))
-    PENDING_POLL_INTERVAL: float = float(_get("PENDING_POLL_INTERVAL", "10"))
-    BROKER_SYNC_INTERVAL: float = float(_get("BROKER_SYNC_INTERVAL", "30"))
     ADJUSTMENT_THRESHOLD: float = float(_get("ADJUSTMENT_THRESHOLD", "30"))
     AUTO_ADJUST: bool = _get("AUTO_ADJUST", "false").lower() == "true"
     TELEGRAM_BOT_TOKEN: str = _get("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = _get("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_MIN_LEVEL: str = _get("TELEGRAM_MIN_LEVEL", "warn")
     WEBHOOK_URL: str = _get("WEBHOOK_URL", "")
     BACKTEST_DEFAULT_DAYS: int = int(_get("BACKTEST_DEFAULT_DAYS", "180"))
+    DELTA_DRIFT_THRESHOLD: float = float(_get("DELTA_DRIFT_THRESHOLD", "30"))
+    BROKER_SYNC_INTERVAL: float = float(_get("BROKER_SYNC_INTERVAL", "30"))
+    PENDING_POLL_INTERVAL: float = float(_get("PENDING_POLL_INTERVAL", "10"))
+    MARGIN_BUFFER_PCT: float = float(_get("MARGIN_BUFFER_PCT", "10"))
 
     @classmethod
     def is_live(cls) -> bool:
