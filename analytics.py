@@ -1,346 +1,347 @@
 # ═══════════════════════════════════════════════════════════════
-# FILE: analytics.py  (NEW — the brain Sensibull has and we didn't)
+# FILE: analytics.py  (NEW)
 # ═══════════════════════════════════════════════════════════════
 """
-Market analytics computed from option chain and historical data:
-  • Max Pain — strike where option writers lose least
-  • PCR — Put-Call Ratio by OI and volume
-  • IV Percentile & Rank — current IV vs historical context
-  • Expected Move — ATM straddle implied range
-  • Probability of Profit — per-strategy PoP
-  • IV Skew — smile/skew across strikes
-  • Support/Resistance from OI — highest OI CE/PE strikes
+Market analytics engine:
+  • Max Pain from OI data
+  • IV Percentile from historical realized vol
+  • Expected Move from ATM straddle
+  • Probability of Profit for active strategies
+  • Put-Call Ratio
+  • Volatility Skew data
+  • What-If scenario analysis
+  • Greeks P&L attribution
+  • Payoff diagram generation
 """
 
 import math
 import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, field
 from scipy.stats import norm
 
-from app_config import Config
+from models import Strategy, Leg, LegStatus, OrderSide, OptionRight, Greeks
 from greeks_engine import BlackScholes, time_to_expiry
-from models import Leg, Strategy, OptionRight, OrderSide, LegStatus
-from utils import LOG, safe_float
+from app_config import Config
+from utils import safe_float, LOG
 
 
-@dataclass
-class MarketAnalytics:
-    """Snapshot of all analytics for an instrument."""
-    max_pain: float = 0.0
-    max_pain_data: List[Dict] = field(default_factory=list)
-    pcr_oi: float = 0.0
-    pcr_volume: float = 0.0
-    total_ce_oi: float = 0.0
-    total_pe_oi: float = 0.0
-    highest_ce_oi_strike: float = 0.0  # resistance
-    highest_pe_oi_strike: float = 0.0  # support
-    expected_move: float = 0.0
-    expected_move_pct: float = 0.0
-    atm_iv: float = 0.0
-    iv_percentile: float = 0.0
-    iv_rank: float = 0.0
-    iv_skew: List[Dict] = field(default_factory=list)
-    spot: float = 0.0
-    timestamp: datetime = field(default_factory=datetime.now)
+# ── Max Pain ─────────────────────────────────────────────────
+
+def calculate_max_pain(chain: List[dict]) -> Tuple[float, List[dict]]:
+    """
+    Max Pain = strike where total ITM value (pain to writers) is minimized.
+
+    For each candidate settlement price K:
+      Call pain = sum of CE_OI * max(0, K - CE_strike) for all calls
+      Put pain  = sum of PE_OI * max(0, PE_strike - K) for all puts
+      Total pain = call_pain + put_pain
+
+    Returns: (max_pain_strike, pain_curve_data)
+    """
+    calls = [(c["strike"], c.get("oi", 0)) for c in chain if c["right"] == "CALL"]
+    puts = [(c["strike"], c.get("oi", 0)) for c in chain if c["right"] == "PUT"]
+
+    strikes = sorted(set(c["strike"] for c in chain))
+    if not strikes:
+        return 0, []
+
+    pain_curve = []
+    min_pain = float("inf")
+    mp_strike = strikes[len(strikes) // 2]
+
+    for K in strikes:
+        call_pain = sum(oi * max(0, K - s) for s, oi in calls)
+        put_pain = sum(oi * max(0, s - K) for s, oi in puts)
+        total = call_pain + put_pain
+
+        pain_curve.append({"strike": K, "call_pain": call_pain,
+                           "put_pain": put_pain, "total": total})
+        if total < min_pain:
+            min_pain = total
+            mp_strike = K
+
+    return mp_strike, pain_curve
 
 
-class AnalyticsEngine:
-    """Computes all analytics from chain data + historical data."""
+# ── PCR ──────────────────────────────────────────────────────
 
-    def __init__(self, session, state):
-        self.session = session
-        self.state = state
-        self._hist_cache: Dict[str, List[Dict]] = {}
-        self._hist_cache_time: Dict[str, float] = {}
-        self._iv_history: Dict[str, List[float]] = {}
+def calculate_pcr(chain: List[dict]) -> Dict[str, float]:
+    """Put-Call Ratio from OI and volume."""
+    total_ce_oi = sum(c.get("oi", 0) for c in chain if c["right"] == "CALL")
+    total_pe_oi = sum(c.get("oi", 0) for c in chain if c["right"] == "PUT")
+    total_ce_vol = sum(c.get("volume", 0) for c in chain if c["right"] == "CALL")
+    total_pe_vol = sum(c.get("volume", 0) for c in chain if c["right"] == "PUT")
 
-    def compute_all(self, chain_data: List[dict], spot: float,
-                    instrument: str, expiry: str) -> MarketAnalytics:
-        """Single entry point — compute everything from one chain snapshot."""
-        a = MarketAnalytics(spot=spot)
-        if not chain_data or spot <= 0:
-            return a
+    return {
+        "pcr_oi": total_pe_oi / max(total_ce_oi, 1),
+        "pcr_vol": total_pe_vol / max(total_ce_vol, 1),
+        "total_ce_oi": total_ce_oi,
+        "total_pe_oi": total_pe_oi,
+    }
 
-        # Parse chain into CE/PE maps
-        ce_map, pe_map = self._parse_chain(chain_data)
-        all_strikes = sorted(set(list(ce_map.keys()) + list(pe_map.keys())))
 
-        if not all_strikes:
-            return a
+# ── Expected Move ────────────────────────────────────────────
 
-        # ── Max Pain ─────────────────────────────────────────
-        a.max_pain, a.max_pain_data = self._compute_max_pain(
-            all_strikes, ce_map, pe_map
-        )
+def calculate_expected_move(spot: float, atm_ce_price: float,
+                            atm_pe_price: float, dte: float) -> Dict:
+    """
+    Expected Move = ATM_straddle_price * 0.85  (empirical)
+    Also: EM = spot * IV * sqrt(DTE/365)
+    """
+    straddle_price = atm_ce_price + atm_pe_price
+    em_empirical = straddle_price * 0.85
+    upper = spot + em_empirical
+    lower = spot - em_empirical
 
-        # ── PCR ──────────────────────────────────────────────
-        a.total_ce_oi = sum(v.get("oi", 0) for v in ce_map.values())
-        a.total_pe_oi = sum(v.get("oi", 0) for v in pe_map.values())
-        a.pcr_oi = round(a.total_pe_oi / a.total_ce_oi, 3) if a.total_ce_oi > 0 else 0
+    # IV-based calculation
+    if spot > 0 and straddle_price > 0 and dte > 0:
+        implied_em_pct = straddle_price / spot * 100
+    else:
+        implied_em_pct = 0
 
-        total_ce_vol = sum(v.get("volume", 0) for v in ce_map.values())
-        total_pe_vol = sum(v.get("volume", 0) for v in pe_map.values())
-        a.pcr_volume = round(total_pe_vol / total_ce_vol, 3) if total_ce_vol > 0 else 0
+    return {
+        "expected_move": round(em_empirical, 2),
+        "upper_range": round(upper, 2),
+        "lower_range": round(lower, 2),
+        "straddle_price": round(straddle_price, 2),
+        "em_percent": round(implied_em_pct, 2),
+    }
 
-        # ── OI Support/Resistance ────────────────────────────
-        if ce_map:
-            a.highest_ce_oi_strike = max(ce_map, key=lambda k: ce_map[k].get("oi", 0))
-        if pe_map:
-            a.highest_pe_oi_strike = max(pe_map, key=lambda k: pe_map[k].get("oi", 0))
 
-        # ── ATM IV + Expected Move ───────────────────────────
-        gap = Config.strike_gap(instrument)
-        from utils import atm_strike
-        atm = atm_strike(spot, gap)
+# ── IV Percentile ────────────────────────────────────────────
 
-        T = time_to_expiry(expiry)
-        atm_ce_ltp = ce_map.get(atm, {}).get("ltp", 0)
-        atm_pe_ltp = pe_map.get(atm, {}).get("ltp", 0)
+def calculate_iv_percentile(historical_closes: List[float],
+                            current_iv: float,
+                            window: int = 20) -> Dict:
+    """
+    Compute realized volatility from historical closes,
+    then rank current IV against the realized vol distribution.
 
-        if atm_ce_ltp > 0:
-            a.atm_iv = BlackScholes.implied_vol(
-                atm_ce_ltp, spot, atm, T, Config.RISK_FREE_RATE, OptionRight.CALL
-            )
-        elif atm_pe_ltp > 0:
-            a.atm_iv = BlackScholes.implied_vol(
-                atm_pe_ltp, spot, atm, T, Config.RISK_FREE_RATE, OptionRight.PUT
-            )
+    IV Percentile = % of past RV readings below current IV
+    IV Rank = (current - min) / (max - min)
+    """
+    if len(historical_closes) < window + 5:
+        return {"iv_percentile": 50, "iv_rank": 0.5,
+                "current_iv": current_iv, "rv_20d": 0, "data_points": 0}
 
-        straddle_price = atm_ce_ltp + atm_pe_ltp
-        a.expected_move = round(straddle_price, 2)
-        a.expected_move_pct = round(straddle_price / spot * 100, 2) if spot > 0 else 0
+    closes = np.array(historical_closes, dtype=float)
+    log_returns = np.diff(np.log(closes))
 
-        # ── IV Skew ──────────────────────────────────────────
-        a.iv_skew = self._compute_iv_skew(ce_map, pe_map, all_strikes, spot, T)
+    # Rolling realized vol
+    rv_series = []
+    for i in range(window, len(log_returns)):
+        chunk = log_returns[i - window:i]
+        rv = np.std(chunk) * math.sqrt(252)  # annualize
+        rv_series.append(rv)
 
-        # ── IV Percentile & Rank ─────────────────────────────
-        a.iv_percentile, a.iv_rank = self._compute_iv_context(
-            instrument, a.atm_iv
-        )
+    if not rv_series:
+        return {"iv_percentile": 50, "iv_rank": 0.5,
+                "current_iv": current_iv, "rv_20d": 0, "data_points": 0}
 
-        # Track IV over time for this session
-        self._track_iv(instrument, a.atm_iv)
+    rv_arr = np.array(rv_series)
+    current_rv = rv_arr[-1]
+    percentile = float(np.sum(rv_arr < current_iv) / len(rv_arr) * 100)
+    rv_min, rv_max = float(np.min(rv_arr)), float(np.max(rv_arr))
+    rank = (current_iv - rv_min) / max(rv_max - rv_min, 0.001)
 
-        return a
+    return {
+        "iv_percentile": round(percentile, 1),
+        "iv_rank": round(min(max(rank, 0), 1), 3),
+        "current_iv": round(current_iv * 100, 2),
+        "rv_20d": round(current_rv * 100, 2),
+        "rv_min": round(rv_min * 100, 2),
+        "rv_max": round(rv_max * 100, 2),
+        "data_points": len(rv_series),
+    }
 
-    def _parse_chain(self, chain: List[dict]) -> Tuple[Dict, Dict]:
-        ce, pe = {}, {}
-        for item in chain:
-            s = item.get("strike", 0)
-            if s <= 0:
-                continue
-            entry = {
-                "ltp": item.get("ltp", 0), "bid": item.get("bid", 0),
-                "ask": item.get("ask", 0), "oi": item.get("oi", 0),
-                "volume": item.get("volume", 0), "iv": item.get("iv", 0),
-                "delta": item.get("delta", 0),
-            }
-            if item.get("right", "").upper() == "CALL":
-                ce[s] = entry
+
+# ── Probability of Profit ────────────────────────────────────
+
+def calculate_pop(strategy: Strategy, spot: float) -> float:
+    """
+    Probability of Profit at expiry using Black-Scholes.
+    For short straddle/strangle: probability that spot stays
+    between the lower and upper breakeven points.
+    """
+    if not strategy.legs or spot <= 0:
+        return 0
+
+    active = [l for l in strategy.legs if l.status in
+              (LegStatus.ACTIVE, LegStatus.ENTERING)]
+    if not active:
+        return 0
+
+    # Find breakeven points
+    total_premium = sum(l.entry_price * l.quantity for l in active
+                        if l.side == OrderSide.SELL)
+    total_premium -= sum(l.entry_price * l.quantity for l in active
+                         if l.side == OrderSide.BUY)
+
+    premium_per_lot = total_premium / max(
+        sum(l.quantity for l in active if l.side == OrderSide.SELL), 1
+    )
+
+    # Identify strikes
+    ce_strikes = [l.strike_price for l in active
+                  if l.right == OptionRight.CALL and l.side == OrderSide.SELL]
+    pe_strikes = [l.strike_price for l in active
+                  if l.right == OptionRight.PUT and l.side == OrderSide.SELL]
+
+    if not ce_strikes or not pe_strikes:
+        return 0
+
+    upper_be = max(ce_strikes) + premium_per_lot
+    lower_be = min(pe_strikes) - premium_per_lot
+
+    # Get IV and time
+    exp = active[0].expiry_date
+    T = time_to_expiry(exp)
+    avg_iv = np.mean([l.greeks.iv for l in active if l.greeks.iv > 0])
+    if avg_iv <= 0:
+        avg_iv = 0.15
+
+    if T <= 0:
+        return 0
+
+    r = Config.RISK_FREE_RATE
+    d_upper = (math.log(upper_be / spot) - (r - 0.5 * avg_iv ** 2) * T) / (
+        avg_iv * math.sqrt(T))
+    d_lower = (math.log(lower_be / spot) - (r - 0.5 * avg_iv ** 2) * T) / (
+        avg_iv * math.sqrt(T))
+
+    pop = float(norm.cdf(d_upper) - norm.cdf(d_lower))
+    return round(pop * 100, 1)
+
+
+# ── Volatility Skew ──────────────────────────────────────────
+
+def calculate_skew(chain: List[dict], spot: float) -> List[dict]:
+    """Extract IV vs strike for skew visualization."""
+    skew_data = []
+    for c in chain:
+        if c.get("iv", 0) > 0:
+            moneyness = c["strike"] / spot if spot > 0 else 1
+            skew_data.append({
+                "strike": c["strike"],
+                "iv": c["iv"],
+                "right": c["right"],
+                "moneyness": round(moneyness, 4),
+            })
+    return sorted(skew_data, key=lambda x: x["strike"])
+
+
+# ── Payoff Diagram ───────────────────────────────────────────
+
+def generate_payoff(strategy: Strategy, spot: float,
+                    num_points: int = 80) -> List[dict]:
+    """
+    Generate (spot_at_expiry, pnl) data for charting.
+    Works for ANY combination of legs (straddle, strangle,
+    iron condor, iron butterfly, custom).
+    """
+    active = [l for l in strategy.legs if l.status in
+              (LegStatus.ACTIVE, LegStatus.ENTERING)]
+    if not active or spot <= 0:
+        return []
+
+    gap = Config.strike_gap(strategy.stock_code)
+    strikes = [l.strike_price for l in active]
+    center = sum(strikes) / len(strikes)
+    spread = max(center * 0.08, gap * 10)
+    low = center - spread
+    high = center + spread
+
+    points = np.linspace(low, high, num_points)
+    payoff = []
+
+    for S in points:
+        pnl = 0.0
+        for leg in active:
+            if leg.right == OptionRight.CALL:
+                intrinsic = max(0, S - leg.strike_price)
             else:
-                pe[s] = entry
-        return ce, pe
+                intrinsic = max(0, leg.strike_price - S)
 
-    def _compute_max_pain(self, strikes, ce_map, pe_map):
-        """
-        Standard max pain algorithm:
-        For each potential expiry price P:
-          pain = Σ(max(P-K,0)*CE_OI[K]) + Σ(max(K-P,0)*PE_OI[K])
-        Max pain = P with minimum total pain.
-        """
-        pain_data = []
-        min_pain = float("inf")
-        mp_strike = strikes[len(strikes) // 2] if strikes else 0
-
-        for P in strikes:
-            total = 0.0
-            for K in strikes:
-                ce_oi = ce_map.get(K, {}).get("oi", 0)
-                pe_oi = pe_map.get(K, {}).get("oi", 0)
-                if P > K and ce_oi > 0:
-                    total += (P - K) * ce_oi
-                if P < K and pe_oi > 0:
-                    total += (K - P) * pe_oi
-            pain_data.append({"strike": P, "pain": round(total / 1e6, 2)})
-            if total < min_pain:
-                min_pain = total
-                mp_strike = P
-
-        return mp_strike, pain_data
-
-    def _compute_iv_skew(self, ce_map, pe_map, strikes, spot, T):
-        skew = []
-        r = Config.RISK_FREE_RATE
-        for K in strikes:
-            entry = {"strike": K}
-            if K in ce_map and ce_map[K]["ltp"] > 0:
-                iv = BlackScholes.implied_vol(
-                    ce_map[K]["ltp"], spot, K, T, r, OptionRight.CALL
-                )
-                entry["ce_iv"] = round(iv * 100, 2)
+            if leg.side == OrderSide.SELL:
+                leg_pnl = (leg.entry_price - intrinsic) * leg.quantity
             else:
-                entry["ce_iv"] = 0
-            if K in pe_map and pe_map[K]["ltp"] > 0:
-                iv = BlackScholes.implied_vol(
-                    pe_map[K]["ltp"], spot, K, T, r, OptionRight.PUT
-                )
-                entry["pe_iv"] = round(iv * 100, 2)
-            else:
-                entry["pe_iv"] = 0
-            skew.append(entry)
-        return skew
+                leg_pnl = (intrinsic - leg.entry_price) * leg.quantity
+            pnl += leg_pnl
 
-    def _compute_iv_context(self, instrument: str, current_iv: float):
-        """
-        IV Percentile and Rank using historical realized vol as proxy.
-        Professional platforms use actual historical IV — we approximate
-        with close-to-close realized vol from underlying OHLC.
-        """
-        if current_iv <= 0:
-            return 0.0, 0.0
+        payoff.append({"spot": round(S, 1), "pnl": round(pnl, 2)})
 
-        hist = self._get_historical_data(instrument)
-        if not hist or len(hist) < 30:
-            return 50.0, 0.5
+    return payoff
 
-        # Compute 20-day rolling realized vol
-        closes = [safe_float(d.get("close", 0)) for d in hist if safe_float(d.get("close", 0)) > 0]
-        if len(closes) < 30:
-            return 50.0, 0.5
 
-        log_returns = [math.log(closes[i] / closes[i - 1])
-                       for i in range(1, len(closes)) if closes[i - 1] > 0]
+# ── What-If Scenario Analysis ────────────────────────────────
 
-        window = 20
-        rolling_vols = []
-        for i in range(window, len(log_returns)):
-            chunk = log_returns[i - window:i]
-            rv = math.sqrt(252 * sum(r ** 2 for r in chunk) / len(chunk))
-            rolling_vols.append(rv)
+def what_if_analysis(strategy: Strategy, spot: float,
+                     scenarios_pct: List[float] = None) -> List[dict]:
+    """
+    Show P&L at CURRENT time for various spot price scenarios.
+    Unlike payoff (at expiry), this uses live Greeks.
+    """
+    if scenarios_pct is None:
+        scenarios_pct = [-5, -4, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 4, 5]
 
-        if not rolling_vols:
-            return 50.0, 0.5
+    active = [l for l in strategy.legs if l.status == LegStatus.ACTIVE]
+    if not active or spot <= 0:
+        return []
 
-        # IV Percentile: % of days where realized vol < current IV
-        below = sum(1 for v in rolling_vols if v < current_iv)
-        iv_pct = round(below / len(rolling_vols) * 100, 1)
+    r = Config.RISK_FREE_RATE
+    results = []
 
-        # IV Rank: (current - min) / (max - min)
-        mn, mx = min(rolling_vols), max(rolling_vols)
-        iv_rank = round((current_iv - mn) / (mx - mn), 3) if mx > mn else 0.5
+    for pct in scenarios_pct:
+        scenario_spot = spot * (1 + pct / 100)
+        total_pnl = 0
 
-        return iv_pct, iv_rank
+        for leg in active:
+            T = time_to_expiry(leg.expiry_date)
+            iv = leg.greeks.iv if leg.greeks.iv > 0 else 0.15
 
-    def _get_historical_data(self, instrument: str) -> List[Dict]:
-        """Fetch and cache 252 days of underlying OHLC."""
-        import time as _time
-        inst = Config.instrument(instrument)
-        cache_key = inst["breeze_code"]
-
-        # Check cache (refresh every 24 hours)
-        if (cache_key in self._hist_cache
-                and _time.time() - self._hist_cache_time.get(cache_key, 0) < 86400):
-            return self._hist_cache[cache_key]
-
-        try:
-            to_dt = datetime.now()
-            from_dt = to_dt - timedelta(days=365)
-            cash_code = inst.get("cash_code", inst["breeze_code"])
-            cash_exc = inst.get("cash_exchange", "NSE")
-
-            r = self.session.breeze.get_historical_data(
-                interval="1day",
-                from_date=from_dt.strftime("%Y-%m-%dT06:00:00.000Z"),
-                to_date=to_dt.strftime("%Y-%m-%dT06:00:00.000Z"),
-                stock_code=cash_code,
-                exchange_code=cash_exc,
-                product_type="cash",
+            new_price = BlackScholes.price(
+                scenario_spot, leg.strike_price, T, r, iv, leg.right
             )
-            if r and r.get("Status") == 200 and r.get("Success"):
-                data = r["Success"]
-                self._hist_cache[cache_key] = data
-                self._hist_cache_time[cache_key] = _time.time()
-                return data
-        except Exception as e:
-            LOG.error(f"Historical data fetch: {e}")
-        return self._hist_cache.get(cache_key, [])
+            new_price = max(new_price, 0.01)
 
-    def _track_iv(self, instrument: str, iv: float):
-        if iv <= 0:
-            return
-        key = instrument
-        if key not in self._iv_history:
-            self._iv_history[key] = []
-        self._iv_history[key].append(iv)
-        if len(self._iv_history[key]) > 5000:
-            self._iv_history[key] = self._iv_history[key][-2500:]
+            if leg.side == OrderSide.SELL:
+                pnl = (leg.entry_price - new_price) * leg.quantity
+            else:
+                pnl = (new_price - leg.entry_price) * leg.quantity
+            total_pnl += pnl
 
-    def get_iv_history(self, instrument: str) -> List[float]:
-        return self._iv_history.get(instrument, [])
+        results.append({
+            "scenario": f"{pct:+.1f}%",
+            "spot": round(scenario_spot, 1),
+            "pnl": round(total_pnl, 2),
+        })
 
-    # ── Probability of Profit ────────────────────────────────
+    return results
 
-    @staticmethod
-    def probability_of_profit(strategy: Strategy, spot: float) -> float:
-        """
-        Compute PoP for a strategy using log-normal distribution.
-        For short straddle/strangle: PoP = P(lower_be < S_T < upper_be)
-        """
-        active = [l for l in strategy.legs if l.status in (LegStatus.ACTIVE, LegStatus.ENTERING)]
-        if not active or spot <= 0:
-            return 0.0
 
-        # Compute breakevens
-        total_premium = sum(l.entry_price * l.quantity for l in active if l.side == OrderSide.SELL)
-        total_premium -= sum(l.entry_price * l.quantity for l in active if l.side == OrderSide.BUY)
+# ── Greeks P&L Attribution ───────────────────────────────────
 
-        if total_premium <= 0:
-            return 0.0
+def greeks_pnl_attribution(strategy: Strategy, spot_change: float,
+                            iv_change: float = 0, days: float = 1
+                            ) -> Dict[str, float]:
+    """
+    Decompose strategy P&L into Greek components:
+      Delta P&L  = Σ (leg_delta * sign * qty) * spot_change
+      Gamma P&L  = 0.5 * Σ (leg_gamma * sign * qty) * spot_change²
+      Theta P&L  = Σ (leg_theta * sign * qty) * days
+      Vega P&L   = Σ (leg_vega * sign * qty) * iv_change
+    """
+    ng = strategy.net_greeks
+    delta_pnl = ng.delta * spot_change
+    gamma_pnl = 0.5 * ng.gamma * spot_change ** 2
+    theta_pnl = ng.theta * days
+    vega_pnl = ng.vega * iv_change * 100
 
-        per_unit_premium = total_premium / active[0].quantity if active[0].quantity > 0 else 0
-        sell_strikes = [l.strike_price for l in active if l.side == OrderSide.SELL]
-        buy_strikes = [l.strike_price for l in active if l.side == OrderSide.BUY]
-
-        if not sell_strikes:
-            return 0.0
-
-        # For straddle: both strikes same
-        # For strangle: CE strike > PE strike
-        ce_legs = [l for l in active if l.right == OptionRight.CALL and l.side == OrderSide.SELL]
-        pe_legs = [l for l in active if l.right == OptionRight.PUT and l.side == OrderSide.SELL]
-
-        if ce_legs and pe_legs:
-            ce_strike = ce_legs[0].strike_price
-            pe_strike = pe_legs[0].strike_price
-            ce_prem = ce_legs[0].entry_price
-            pe_prem = pe_legs[0].entry_price
-
-            # Account for bought wings (iron condor)
-            buy_ce = [l for l in active if l.right == OptionRight.CALL and l.side == OrderSide.BUY]
-            buy_pe = [l for l in active if l.right == OptionRight.PUT and l.side == OrderSide.BUY]
-            net_ce = ce_prem - (buy_ce[0].entry_price if buy_ce else 0)
-            net_pe = pe_prem - (buy_pe[0].entry_price if buy_pe else 0)
-
-            upper_be = ce_strike + net_ce + net_pe
-            lower_be = pe_strike - net_ce - net_pe
-        else:
-            return 50.0
-
-        # Use ATM IV for the distribution
-        T = time_to_expiry(active[0].expiry_date)
-        if T <= 0:
-            return 50.0
-
-        iv = active[0].greeks.iv if active[0].greeks.iv > 0 else 0.15
-        sigma_sqrt_t = iv * math.sqrt(T)
-
-        if sigma_sqrt_t <= 0:
-            return 50.0
-
-        d_upper = (math.log(upper_be / spot)) / sigma_sqrt_t
-        d_lower = (math.log(lower_be / spot)) / sigma_sqrt_t
-
-        pop = (norm.cdf(d_upper) - norm.cdf(d_lower)) * 100
-        return round(max(0, min(100, pop)), 1)
+    return {
+        "delta_pnl": round(delta_pnl, 2),
+        "gamma_pnl": round(gamma_pnl, 2),
+        "theta_pnl": round(theta_pnl, 2),
+        "vega_pnl": round(vega_pnl, 2),
+        "total_attributed": round(delta_pnl + gamma_pnl + theta_pnl + vega_pnl, 2),
+    }
