@@ -195,3 +195,47 @@ class OrderManager:
         except Exception:
             pass
         return 0.0
+
+    def buy_entry_market(self, leg: Leg) -> bool:
+        """
+        Buy to OPEN a position (for iron condor protective wings).
+        Different from buy_market which is buy to CLOSE.
+        """
+        result = self.session.place_order(
+            stock_code=leg.stock_code,
+            exchange_code=leg.exchange_code,
+            product="options",
+            action="buy",
+            order_type="market",
+            stoploss="",
+            quantity=str(leg.quantity),
+            price="0",
+            validity="day",
+            validity_date="",
+            disclosed_quantity="0",
+            expiry_date=leg.expiry_date,
+            right=leg.right.value,
+            strike_price=str(int(leg.strike_price)),
+        )
+        if not result or result.get("Status") != 200:
+            self.state.add_log("ERROR", "Order",
+                               f"Buy entry failed: {leg.display_name}")
+            return False
+
+        order_id = result["Success"]["order_id"]
+        self._poll_fill(order_id, 5.0, leg.exchange_code)
+        fp = self._extract_fill_price(order_id, self._get_ltp(leg), leg.exchange_code)
+
+        leg.entry_order_id = order_id
+        leg.entry_price = fp
+        leg.current_price = fp
+        leg.status = LegStatus.ACTIVE
+        leg.entry_time = datetime.now().isoformat()
+        # No SL for protective legs — strategy-level SL applies
+        leg.sl_price = 0
+        self.db.save_leg(leg)
+        self.db.log_order(leg.leg_id, order_id, "buy", "filled",
+                          fp, leg.quantity, "protective wing")
+        self.state.add_log("INFO", "Order",
+                           f"BUY ENTRY: {leg.display_name} @ ₹{fp:.2f}")
+        return True
