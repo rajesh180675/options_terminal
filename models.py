@@ -37,8 +37,10 @@ class OptionRight(str, Enum):
 class StrategyType(str, Enum):
     SHORT_STRADDLE = "short_straddle"
     SHORT_STRANGLE = "short_strangle"
+    IRON_CONDOR = "iron_condor"
+    IRON_BUTTERFLY = "iron_butterfly"
     MANUAL_SELL = "manual_sell"
-
+    
 class StrategyStatus(str, Enum):
     DEPLOYING = "deploying"
     ACTIVE = "active"
