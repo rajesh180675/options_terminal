@@ -1,458 +1,722 @@
-# ═══════════════════════════════════════════════════════════════
-# FILE: main.py  (COMPLETE REWRITE — 6 professional tabs)
-# ═══════════════════════════════════════════════════════════════
 """
-streamlit run main.py
+main.py (Streamlit UI)
 
 Tabs:
-  1. Chain — Option chain with Greeks
-  2. Limit Order — Manual sell with margin preview
-  3. Positions — Strategies + broker sync + EXIT BUTTONS
-  4. Broker — Order book + Trade book + Funds + Reconciliation
-  5. Dashboard — MTM chart, portfolio Greeks
-  6. Logs — Agent thoughts + order history
+  1) Chain
+  2) Limit Sell
+  3) Positions (with manual exit)
+  4) Broker (Funds / Orders / Trades / Positions / Recon)
+  5) Analytics (Max Pain / PCR / Expected Move / Skew / Payoff / What-if)
+  6) Journal (if journal.py exists)
+  7) Backtest (if backtester.py exists)
+  8) Logs
+
+This UI is designed to be "flicker-free" using Streamlit containers and caching.
 """
+
+from __future__ import annotations
+
+import time
+from datetime import datetime, timedelta
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-
-st.set_page_config(page_title="Options Terminal", page_icon="📊",
-                   layout="wide", initial_sidebar_state="expanded")
-
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=1500, limit=None, key="r")
-except ImportError:
-    pass
 
 from app_config import Config, INSTRUMENTS
+from models import StrategyStatus, LegStatus, OptionRight
 from utils import breeze_expiry, next_weekly_expiry, is_expiry_day, atm_strike
-from models import LegStatus, StrategyStatus, OptionRight
+
+st.set_page_config(
+    page_title="Options Terminal",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Auto-refresh
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=1500, limit=None, key="refresh")
+except Exception:
+    pass
 
 
 @st.cache_resource
-def boot():
+def boot_engine():
     from trading_engine import TradingEngine
-    e = TradingEngine()
-    return e, e.start()
+    eng = TradingEngine()
+    ok = eng.start()
+    return eng, ok
 
-engine, ok = boot()
+
+engine, engine_ok = boot_engine()
 state = engine.state
 
-# ── CSS ──────────────────────────────────────────────────────
 
-st.markdown("""<style>
-.pnl-pos{background:linear-gradient(135deg,#0d4d2b,#1a6b3f);color:#00ff88;
-  padding:12px 20px;border-radius:10px;font-size:26px;font-weight:bold;text-align:center}
-.pnl-neg{background:linear-gradient(135deg,#4d0d0d,#6b1a1a);color:#ff4444;
-  padding:12px 20px;border-radius:10px;font-size:26px;font-weight:bold;text-align:center}
-.b{padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;display:inline-block}
-.bg{background:#0d4d2b;color:#00ff88}.br{background:#4d0d0d;color:#ff4444}
-.by{background:#4d4d0d;color:#ffff44}.bb{background:#0d2d4d;color:#44aaff}
-.lb{font-family:monospace;font-size:11px;background:#0d1117;padding:8px;
-  border-radius:6px;max-height:380px;overflow-y:auto;border:1px solid #21262d}
-</style>""", unsafe_allow_html=True)
+# ── CSS ──────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.pnl-pos { background: linear-gradient(135deg, #0d4d2b, #1a6b3f);
+    color: #00ff88; padding: 12px 18px; border-radius: 10px;
+    font-size: 26px; font-weight: 800; text-align: center; }
+.pnl-neg { background: linear-gradient(135deg, #4d0d0d, #6b1a1a);
+    color: #ff4444; padding: 12px 18px; border-radius: 10px;
+    font-size: 26px; font-weight: 800; text-align: center; }
+.badge { padding: 4px 12px; border-radius: 12px;
+    font-size: 12px; font-weight: 700; display: inline-block; }
+.bg { background: #0d4d2b; color: #00ff88; }
+.br { background: #4d0d0d; color: #ff4444; }
+.by { background: #4d4d0d; color: #ffff44; }
+.bb { background: #0d2d4d; color: #44aaff; }
+.logbox { font-family: 'Courier New', monospace; font-size: 11px;
+    background: #0d1117; padding: 10px; border-radius: 8px;
+    max-height: 420px; overflow-y: auto; border: 1px solid #21262d; }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ── HEADER ───────────────────────────────────────────────────
-
 mtm = state.get_total_mtm()
-hc = st.columns([3, 1, 1, 1, 1, 1])
-pc = "pnl-pos" if mtm >= 0 else "pnl-neg"
-hc[0].markdown(f'<div class="{pc}">MTM: ₹{"+" if mtm>=0 else ""}{mtm:,.2f}</div>', unsafe_allow_html=True)
-hc[1].markdown(f'<span class="b {"bg" if state.connected else "br"}">API {"✓" if state.connected else "✗"}</span>', unsafe_allow_html=True)
-hc[2].markdown(f'<span class="b {"bg" if state.ws_connected else "br"}">WS {"✓" if state.ws_connected else "✗"}</span>', unsafe_allow_html=True)
+pnl_cls = "pnl-pos" if mtm >= 0 else "pnl-neg"
+pnl_sign = "+" if mtm >= 0 else ""
+
+hdr = st.columns([3, 1, 1, 1, 1, 1])
+
+hdr[0].markdown(f'<div class="{pnl_cls}">Total MTM: ₹{pnl_sign}{mtm:,.2f}</div>', unsafe_allow_html=True)
+
+hdr[1].markdown(
+    f'<span class="badge {"bg" if state.connected else "br"}">API {"✓" if state.connected else "✗"}</span>',
+    unsafe_allow_html=True
+)
+hdr[2].markdown(
+    f'<span class="badge {"bg" if state.ws_connected else "br"}">WS {"✓" if state.ws_connected else "✗"}</span>',
+    unsafe_allow_html=True
+)
 
 dc = Config.breeze_code(Config.DEFAULT_STOCK)
 spot = state.get_spot(dc)
-hc[3].markdown(f'<span class="b by">{Config.DEFAULT_STOCK}: ₹{spot:,.1f}</span>', unsafe_allow_html=True)
+hdr[3].markdown(f'<span class="badge by">{Config.DEFAULT_STOCK}: ₹{spot:,.1f}</span>', unsafe_allow_html=True)
 
-# Funds in header
-funds = engine.broker.get_funds()
+# Margin badge
+funds = engine.broker.get_funds() if getattr(engine, "broker", None) else None
 margin_txt = f"₹{funds.free_margin:,.0f}" if funds else "N/A"
-hc[4].markdown(f'<span class="b bb">Margin: {margin_txt}</span>', unsafe_allow_html=True)
+hdr[4].markdown(f'<span class="badge bb">Margin: {margin_txt}</span>', unsafe_allow_html=True)
 
-hc[5].markdown(f'<span class="b {"br" if Config.is_live() else "by"}">{Config.TRADING_MODE.upper()}</span>', unsafe_allow_html=True)
+mode_cls = "br" if Config.is_live() else "by"
+hdr[5].markdown(f'<span class="badge {mode_cls}">{Config.TRADING_MODE.upper()}</span>', unsafe_allow_html=True)
+
 st.divider()
 
 
 # ── SIDEBAR ──────────────────────────────────────────────────
-
 with st.sidebar:
-    st.header("⚙️ Deploy")
-    inst_name = st.selectbox("Instrument", list(INSTRUMENTS.keys()))
+    st.header("Deploy")
+
+    inst_name = st.selectbox("Instrument", list(INSTRUMENTS.keys()), index=0)
     inst = Config.instrument(inst_name)
-    bc = inst["breeze_code"]; exc = inst["exchange"]
+    breeze_code = inst["breeze_code"]
+    exchange = inst["exchange"]
+
     exp_dt = next_weekly_expiry(inst_name)
     exp_str = breeze_expiry(exp_dt)
-    wd = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    st.caption(f"📅 {exp_dt.strftime('%d-%b-%Y')} ({wd[inst['expiry_weekday']]})")
-    st.caption(f"🔑 {exc}/{bc} lot={inst['lot_size']}")
-    if is_expiry_day(inst_name): st.warning("⚠️ EXPIRY DAY")
 
-    lots = st.number_input("Lots", 1, 50, 1)
-    sl_pct = st.slider("SL%", 10, 200, int(Config.SL_PERCENTAGE))
+    wd = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    st.caption(f"Expiry: {exp_dt.strftime('%d-%b-%Y')} ({wd[inst['expiry_weekday']]})")
+    st.caption(f"Exchange/Code: {exchange}/{breeze_code}")
+    st.caption(f"Lot: {inst['lot_size']}  |  Strike gap: {inst['strike_gap']}")
 
-    st.subheader("Straddle")
-    if st.button("🔴 Deploy Straddle", use_container_width=True, type="primary"):
-        with st.spinner("..."): r = engine.deploy_straddle(inst_name, exp_str, lots, float(sl_pct))
-        st.success(f"OK: {r.strategy_id}") if r else st.error("Failed — check margin/logs")
+    if is_expiry_day(inst_name):
+        st.warning("Today is expiry day")
 
-    st.subheader("Strangle")
-    td = st.slider("Target Δ", 0.05, 0.40, 0.15, 0.01)
-    if st.button("🔴 Deploy Strangle", use_container_width=True, type="primary"):
-        with st.spinner("..."): r = engine.deploy_strangle(inst_name, td, exp_str, lots, float(sl_pct))
-        st.success(f"OK: {r.strategy_id}") if r else st.error("Failed")
+    lots = st.number_input("Lots", min_value=1, max_value=50, value=1)
+    sl_pct = st.slider("SL %", min_value=10, max_value=200, value=int(Config.SL_PERCENTAGE))
+
+    st.subheader("Short Straddle")
+    if st.button("Deploy Straddle", use_container_width=True, type="primary"):
+        with st.spinner("Deploying..."):
+            r = engine.deploy_straddle(inst_name, exp_str, int(lots), float(sl_pct))
+        if r:
+            st.success(f"Deployed: {r.strategy_id}")
+        else:
+            st.error("Deployment failed")
+
+    st.subheader("Short Strangle")
+    tdelta = st.slider("Target Delta", 0.05, 0.40, 0.15, 0.01)
+    if st.button("Deploy Strangle", use_container_width=True, type="primary"):
+        with st.spinner("Deploying..."):
+            r = engine.deploy_strangle(inst_name, float(tdelta), exp_str, int(lots), float(sl_pct))
+        if r:
+            st.success(f"Deployed: {r.strategy_id}")
+        else:
+            st.error("Deployment failed")
+
+    st.subheader("Iron Condor")
+    ic_delta = st.slider("IC Delta", 0.05, 0.30, 0.15, 0.01)
+    ic_wing = st.number_input("Wing width (points)", value=int(inst["strike_gap"] * 2), step=int(inst["strike_gap"]))
+    if st.button("Deploy Iron Condor", use_container_width=True):
+        with st.spinner("Deploying..."):
+            r = engine.deploy_iron_condor(inst_name, float(ic_delta), int(ic_wing), exp_str, int(lots), float(sl_pct))
+        if r:
+            st.success(f"Deployed: {r.strategy_id}")
+        else:
+            st.error("Deployment failed")
+
+    st.subheader("Iron Butterfly")
+    ib_wing = st.number_input("IB wing width (points)", value=int(inst["strike_gap"] * 3), step=int(inst["strike_gap"]))
+    if st.button("Deploy Iron Butterfly", use_container_width=True):
+        with st.spinner("Deploying..."):
+            r = engine.deploy_iron_butterfly(inst_name, int(ib_wing), exp_str, int(lots), float(sl_pct))
+        if r:
+            st.success(f"Deployed: {r.strategy_id}")
+        else:
+            st.error("Deployment failed")
 
     st.divider()
-    st.subheader("🚨 Kill Switch")
-    if st.button("⚠️ PANIC EXIT", use_container_width=True, type="primary",
-                 disabled=not st.checkbox("Confirm close ALL")):
-        engine.trigger_panic(); st.error("🚨 PANIC")
+    st.subheader("Kill Switch")
+    confirm = st.checkbox("Confirm close ALL positions")
+    if st.button("PANIC EXIT", use_container_width=True, type="primary", disabled=not confirm):
+        engine.trigger_panic()
+        st.error("Panic exit triggered")
 
-    st.divider()
-    with st.expander("Config"): st.json(Config.dump())
+    with st.expander("Config (non-sensitive)"):
+        st.json(Config.dump())
+
+
+# ── Tabs ─────────────────────────────────────────────────────
+tabs = st.tabs(["Chain", "Limit Sell", "Positions", "Broker", "Analytics", "Journal", "Backtest", "Logs"])
+tab_chain, tab_limit, tab_pos, tab_broker, tab_analytics, tab_journal, tab_backtest, tab_logs = tabs
+
+
+# ── Tab: Chain ───────────────────────────────────────────────
+with tab_chain:
+    st.subheader(f"Option Chain — {inst_name}")
+
     try:
-        from rate_limiter import get_rate_limiter
-        st.caption(f"Rate: {get_rate_limiter().remaining}/{Config.API_RATE_LIMIT}")
-    except: pass
+        chain = engine.get_chain(inst_name, exp_str)
+    except Exception as e:
+        chain = []
+        st.warning(f"Chain error: {e}")
 
+    if not chain:
+        st.info("Loading chain...")
+    else:
+        df = pd.DataFrame(chain)
+        ce = df[df["right"] == "CALL"].rename(columns={
+            "ltp": "CE LTP", "bid": "CE Bid", "ask": "CE Ask",
+            "iv": "CE IV%", "delta": "CE Δ", "theta": "CE Θ",
+            "vega": "CE V", "oi": "CE OI",
+        })[["strike", "CE OI", "CE IV%", "CE Δ", "CE Θ", "CE V", "CE Bid", "CE LTP", "CE Ask"]]
 
-# ── TABS ─────────────────────────────────────────────────────
+        pe = df[df["right"] == "PUT"].rename(columns={
+            "ltp": "PE LTP", "bid": "PE Bid", "ask": "PE Ask",
+            "iv": "PE IV%", "delta": "PE Δ", "theta": "PE Θ",
+            "vega": "PE V", "oi": "PE OI",
+        })[["strike", "PE Bid", "PE LTP", "PE Ask", "PE Δ", "PE Θ", "PE V", "PE IV%", "PE OI"]]
 
-t1, t2, t3, t4, t5, t6 = st.tabs([
-    "📈 Chain", "📝 Limit", "📋 Positions",
-    "🏦 Broker", "📊 Dashboard", "📝 Logs",
-])
+        merged = pd.merge(ce, pe, on="strike", how="outer").sort_values("strike").fillna(0)
 
+        spot_here = state.get_spot(breeze_code)
+        if spot_here > 0:
+            atm = atm_strike(spot_here, inst["strike_gap"])
 
-# ── TAB 1: CHAIN ────────────────────────────────────────────
-
-with t1:
-    st.subheader(f"Option Chain — {inst_name} ({exc})")
-    try: chain_data = engine.get_chain(inst_name, exp_str)
-    except: chain_data = []
-
-    if chain_data:
-        df = pd.DataFrame(chain_data)
-        dfc = df[df["right"]=="CALL"].rename(columns={
-            "ltp":"CE","bid":"CE Bid","ask":"CE Ask","iv":"CE IV%",
-            "delta":"CE Δ","theta":"CE Θ","oi":"CE OI"
-        })[["strike","CE OI","CE IV%","CE Δ","CE Θ","CE Bid","CE","CE Ask"]]
-        dfp = df[df["right"]=="PUT"].rename(columns={
-            "ltp":"PE","bid":"PE Bid","ask":"PE Ask","iv":"PE IV%",
-            "delta":"PE Δ","theta":"PE Θ","oi":"PE OI"
-        })[["strike","PE Bid","PE","PE Ask","PE Δ","PE Θ","PE IV%","PE OI"]]
-        m = pd.merge(dfc, dfp, on="strike", how="outer").sort_values("strike").fillna(0)
-        if spot > 0:
-            atm_v = atm_strike(spot, inst["strike_gap"])
             def hl(row):
-                return ["background-color:#1a3a5c"]*len(row) if row["strike"]==atm_v else [""]*len(row)
-            st.dataframe(m.style.apply(hl, axis=1), use_container_width=True, height=500, hide_index=True)
+                return ["background-color:#1a3a5c"] * len(row) if row["strike"] == atm else [""] * len(row)
+
+            st.dataframe(merged.style.apply(hl, axis=1), use_container_width=True, height=520, hide_index=True)
         else:
-            st.dataframe(m, use_container_width=True, height=500, hide_index=True)
+            st.dataframe(merged, use_container_width=True, height=520, hide_index=True)
+
+
+# ── Tab: Limit Sell ──────────────────────────────────────────
+with tab_limit:
+    st.subheader("Manual Limit Sell")
+
+    # build strike choices from chain
+    if "chain" in locals() and chain:
+        strikes = sorted(set(c["strike"] for c in chain))
     else:
-        st.info("Loading...")
+        center = int(spot) if spot > 0 else 24000
+        gap = int(inst["strike_gap"])
+        strikes = [center + i * gap for i in range(-10, 11)]
 
-
-# ── TAB 2: LIMIT ORDER ──────────────────────────────────────
-
-with t2:
-    st.subheader(f"📝 Limit Sell — {inst_name}")
-    c1,c2,c3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if chain_data: strikes = sorted(set(c["strike"] for c in chain_data))
-        else:
-            g=inst["strike_gap"]; ct=int(spot) if spot>0 else 24000
-            strikes=[ct+i*g for i in range(-10,11)]
-        sel_s = st.selectbox("Strike", strikes, index=len(strikes)//2)
+        strike = st.selectbox("Strike", strikes, index=len(strikes)//2 if strikes else 0)
     with c2:
-        sr = st.radio("Type", ["CALL","PUT"], horizontal=True)
-        opt_r = OptionRight.CALL if sr=="CALL" else OptionRight.PUT
+        right_str = st.radio("Type", ["CALL", "PUT"], horizontal=True)
+        right = OptionRight.CALL if right_str == "CALL" else OptionRight.PUT
     with c3:
-        ll = st.number_input("Lots", 1, 50, 1, key="ll")
-        lsl = st.slider("SL%", 10, 200, int(Config.SL_PERCENTAGE), key="lsl")
+        l_lots = st.number_input("Lots", min_value=1, max_value=50, value=1, key="limit_lots")
+        l_sl = st.slider("SL %", 10, 200, int(Config.SL_PERCENTAGE), key="limit_sl")
 
-    dpx = 100.0
-    if chain_data:
-        mm = [c for c in chain_data if c["strike"]==sel_s and c["right"]==sr]
-        if mm:
-            mc=st.columns(5)
-            mc[0].metric("Bid", f"₹{mm[0]['bid']:.2f}")
-            mc[1].metric("LTP", f"₹{mm[0]['ltp']:.2f}")
-            mc[2].metric("Ask", f"₹{mm[0]['ask']:.2f}")
-            mc[3].metric("IV%", f"{mm[0]['iv']:.1f}")
-            mc[4].metric("Δ", f"{mm[0]['delta']:.4f}")
-            dpx = mm[0]["bid"] if mm[0]["bid"]>0 else mm[0]["ltp"]
+    # Default price from chain bid
+    default_px = 100.0
+    if chain:
+        m = [c for c in chain if c["strike"] == strike and c["right"] == right_str]
+        if m:
+            default_px = float(m[0]["bid"] if m[0]["bid"] > 0 else m[0]["ltp"])
+            mcols = st.columns(5)
+            mcols[0].metric("Bid", f"₹{m[0]['bid']:.2f}")
+            mcols[1].metric("LTP", f"₹{m[0]['ltp']:.2f}")
+            mcols[2].metric("Ask", f"₹{m[0]['ask']:.2f}")
+            mcols[3].metric("IV%", f"{m[0]['iv']:.1f}")
+            mcols[4].metric("Δ", f"{m[0]['delta']:.4f}")
 
-    lpx = st.number_input("Limit ₹", 0.05, 50000.0, float(round(dpx,2)), 0.05, format="%.2f", key="lpx")
-    qty = inst["lot_size"]*ll
-    st.info(f"**SELL {qty} × {bc} {sel_s} {sr}** @ ₹{lpx:.2f} | Premium ₹{lpx*qty:,.0f} | SL ₹{round(lpx*(1+lsl/100),2)}")
+    limit_px = st.number_input("Limit price", min_value=0.05, value=float(round(default_px, 2)), step=0.05, format="%.2f")
 
-    # Margin check display
-    ok_m, req_m, msg_m = engine.broker.check_margin(bc, exc, float(sel_s), opt_r.value, exp_str, qty, lpx, "sell")
-    if ok_m:
-        st.success(f"✅ Margin: {msg_m}")
-    else:
-        st.error(f"❌ Margin: {msg_m}")
+    qty = inst["lot_size"] * int(l_lots)
+    sl_val = round(limit_px * (1 + float(l_sl) / 100.0), 2)
+    st.info(f"SELL {qty} × {breeze_code} {int(strike)} {right_str} @ ₹{limit_px:.2f} | SL ₹{sl_val:.2f}")
 
-    if st.button("📤 Place Limit Sell", use_container_width=True, type="primary", disabled=not ok_m):
-        with st.spinner("Placing..."):
-            r = engine.deploy_limit_sell(inst_name, float(sel_s), opt_r, exp_str, ll, lpx, float(lsl))
-        st.success(f"OK: {r.strategy_id}") if r else st.error("Failed")
+    # Margin check (if broker sync available)
+    can_place = True
+    if getattr(engine, "broker", None):
+        try:
+            ok_m, req_m, msg_m = engine.broker.check_margin(
+                breeze_code, exchange, float(strike), right.value, exp_str, qty, float(limit_px), action="sell"
+            )
+            can_place = bool(ok_m)
+            st.success(f"Margin: {msg_m}") if ok_m else st.error(f"Margin: {msg_m}")
+        except Exception as e:
+            st.warning(f"Margin check unavailable: {e}")
+
+    if st.button("Place Limit Sell", use_container_width=True, type="primary", disabled=not can_place):
+        with st.spinner("Placing order..."):
+            r = engine.deploy_limit_sell(inst_name, float(strike), right, exp_str, int(l_lots), float(limit_px), float(l_sl))
+        if r:
+            st.success(f"Order placed: {r.strategy_id}")
+        else:
+            st.error("Order failed — check logs")
 
 
-# ── TAB 3: POSITIONS + EXIT BUTTONS ─────────────────────────
+# ── Tab: Positions ───────────────────────────────────────────
+with tab_pos:
+    st.subheader("Active Strategies")
 
-with t3:
-    st.subheader("Positions & Exit")
     strategies = state.get_strategies()
     if not strategies:
         st.info("No active strategies.")
     else:
         for s in strategies:
-            em = {"active":"🟢","deploying":"🟡","partial_exit":"🟠","closed":"⚫","error":"🔴"}.get(s.status.value,"⚪")
             pnl = s.compute_total_pnl()
-            with st.expander(f"{em} {s.strategy_type.value.replace('_',' ').upper()} [{s.strategy_id}] — {'green' if pnl>=0 else 'red'}[₹{pnl:+,.2f}]", expanded=(s.status==StrategyStatus.ACTIVE)):
+            emoji = {
+                StrategyStatus.ACTIVE: "🟢",
+                StrategyStatus.DEPLOYING: "🟡",
+                StrategyStatus.PARTIAL_EXIT: "🟠",
+                StrategyStatus.CLOSED: "⚫",
+                StrategyStatus.ERROR: "🔴",
+            }.get(s.status, "⚪")
+
+            with st.expander(
+                f"{emoji} {s.strategy_type.value.replace('_',' ').upper()} [{s.strategy_id}]  "
+                f"P&L: {'₹%+.2f' % pnl}",
+                expanded=(s.status == StrategyStatus.ACTIVE),
+            ):
                 for leg in s.legs:
-                    lc = st.columns([1,1,1,1,1,1,1,1,2])
-                    lc[0].write(f"**{leg.right.value[0].upper()}E**")
-                    lc[1].write(f"K={int(leg.strike_price)}")
-                    lc[2].write(f"Entry=₹{leg.entry_price:.2f}")
-                    lc[3].write(f"LTP=₹{leg.current_price:.2f}")
-                    lc[4].write(f"SL=₹{leg.sl_price:.2f}{'🔄' if leg.trailing_active else ''}")
-                    lc[5].write(f"P&L=₹{leg.pnl:+,.0f}")
-                    lc[6].write(f"Δ={leg.greeks.delta:.3f}")
-                    lc[7].write(f"**{leg.status.value}**")
-                    with lc[8]:
-                        if leg.status == LegStatus.ACTIVE:
-                            if st.button(f"🔴 Exit", key=f"exit_{leg.leg_id}", type="primary"):
-                                ok = engine.exit_leg(leg.leg_id)
-                                st.success("Exited") if ok else st.error("Failed")
-                                st.rerun()
+                    cols = st.columns([1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.5])
+                    cols[0].write(f"**{leg.right.value[0].upper()}E**")
+                    cols[1].write(f"K={int(leg.strike_price)}")
+                    cols[2].write(f"Entry={leg.entry_price:.2f}")
+                    cols[3].write(f"LTP={leg.current_price:.2f}")
+                    cols[4].write(f"SL={leg.sl_price:.2f}{' (trail)' if leg.trailing_active else ''}")
+                    cols[5].write(f"P&L={leg.pnl:+.0f}")
+                    cols[6].write(f"Δ={leg.greeks.delta:.3f}")
+                    cols[7].write(f"{leg.status.value}")
+
+                    if leg.status == LegStatus.ACTIVE:
+                        if st.button("Exit Leg (Market)", key=f"exit_{leg.leg_id}", type="primary"):
+                            ok = engine.exit_leg(leg.leg_id)
+                            st.success("Exited") if ok else st.error("Exit failed")
+                            st.rerun()
 
                 ng = s.net_greeks
-                gc = st.columns(4)
-                gc[0].metric("Net Δ", f"{ng.delta:+.1f}")
-                gc[1].metric("Net Γ", f"{ng.gamma:+.4f}")
-                gc[2].metric("Net Θ", f"₹{ng.theta:+.1f}")
-                gc[3].metric("Net V", f"{ng.vega:+.1f}")
+                gcols = st.columns(4)
+                gcols[0].metric("Net Δ", f"{ng.delta:+.1f}")
+                gcols[1].metric("Net Γ", f"{ng.gamma:+.4f}")
+                gcols[2].metric("Net Θ", f"₹{ng.theta:+.1f}")
+                gcols[3].metric("Net V", f"{ng.vega:+.1f}")
 
-    # Broker reconciliation
-    recon = engine.broker.get_recon_issues()
-    if recon:
-        st.divider()
-        st.subheader("⚠️ Reconciliation Issues")
-        for issue in recon:
-            st.warning(issue)
+    # Reconciliation issues if broker sync exists
+    if getattr(engine, "broker", None):
+        issues = engine.broker.get_recon_issues()
+        if issues:
+            st.divider()
+            st.subheader("Reconciliation Issues")
+            for x in issues:
+                st.warning(x)
 
 
-# ── TAB 4: BROKER DATA ──────────────────────────────────────
+# ── Tab: Broker ──────────────────────────────────────────────
+with tab_broker:
+    st.subheader("Broker")
 
-with t4:
-    st.subheader("🏦 Broker Data")
-    bt1, bt2, bt3, bt4 = st.tabs(["💰 Funds", "📋 Orders", "📊 Trades", "📍 Positions"])
+    if not getattr(engine, "broker", None):
+        st.info("broker_sync.py not available in this build.")
+    else:
+        t_funds, t_orders, t_trades, t_positions, t_recon = st.tabs(["Funds", "Orders", "Trades", "Positions", "Recon"])
 
-    with bt1:
-        st.markdown("**Account Funds**")
-        funds = engine.broker.get_funds()
-        if funds:
-            fc = st.columns(4)
-            fc[0].metric("Allocated", f"₹{funds.allocated:,.0f}")
-            fc[1].metric("Utilized", f"₹{funds.utilized:,.0f}")
-            fc[2].metric("Available", f"₹{funds.free_margin:,.0f}")
-            fc[3].metric("Blocked", f"₹{funds.blocked:,.0f}")
-        else:
-            st.info("Funds data loading...")
+        with t_funds:
+            st.markdown("Account funds")
+            funds = engine.broker.get_funds()
+            if funds:
+                c = st.columns(4)
+                c[0].metric("Allocated", f"₹{funds.allocated:,.0f}")
+                c[1].metric("Utilized", f"₹{funds.utilized:,.0f}")
+                c[2].metric("Free", f"₹{funds.free_margin:,.0f}")
+                c[3].metric("Blocked", f"₹{funds.blocked:,.0f}")
+            if st.button("Refresh funds"):
+                engine.broker.fetch_funds()
+                st.rerun()
 
-        if st.button("🔄 Refresh Funds"):
-            engine.broker.fetch_funds()
-            st.rerun()
+            cust = engine.broker.get_customer_details()
+            if cust:
+                with st.expander("Customer details"):
+                    st.json(cust)
 
-        # Customer details
-        cust = engine.broker.get_customer_details()
-        if cust:
-            with st.expander("Customer Details"):
-                st.json(cust)
+        with t_orders:
+            if st.button("Refresh orders"):
+                engine.broker.fetch_orders("NFO")
+                engine.broker.fetch_orders("BFO")
+                st.rerun()
 
-    with bt2:
-        st.markdown("**Today's Orders**")
-        if st.button("🔄 Refresh Orders"):
-            engine.broker.fetch_orders()
-            engine.broker.fetch_orders("BFO")
-            st.rerun()
+            orders = engine.broker.get_orders()
+            if orders:
+                odf = pd.DataFrame([{
+                    "order_id": o.order_id,
+                    "exc": o.exchange_code,
+                    "stock": o.stock_code,
+                    "strike": int(o.strike_price) if o.strike_price else "",
+                    "type": (o.right[:1].upper() if o.right else ""),
+                    "action": o.action,
+                    "qty": o.quantity,
+                    "price": o.price,
+                    "avg": o.avg_price,
+                    "status": o.status,
+                    "time": o.order_time,
+                } for o in orders])
+                st.dataframe(odf, use_container_width=True, height=380, hide_index=True)
 
-        orders = engine.broker.get_orders()
-        if orders:
-            odf = pd.DataFrame([{
-                "ID": o.order_id[-8:] if len(o.order_id) > 8 else o.order_id,
-                "Stock": o.stock_code, "Strike": int(o.strike_price) if o.strike_price else "",
-                "Type": o.right[:1].upper() if o.right else "",
-                "Action": o.action, "OrdType": o.order_type,
-                "Qty": o.quantity, "Price": o.price,
-                "AvgPx": o.avg_price, "Status": o.status,
-                "Time": o.order_time,
-            } for o in orders])
-
-            def color_ord_status(v):
-                if v == "Executed": return "background:#0d4d2b;color:#00ff88"
-                if v in ("Cancelled","Rejected"): return "background:#4d0d0d;color:#ff4444"
-                if v == "Pending": return "background:#4d4d0d;color:#ffff44"
-                return ""
-
-            st.dataframe(odf.style.applymap(color_ord_status, subset=["Status"]),
-                         use_container_width=True, hide_index=True, height=400)
-
-            # Cancel/Modify pending orders
-            pending = [o for o in orders if o.status == "Pending"]
-            if pending:
-                st.subheader("Pending Order Actions")
-                for o in pending:
-                    pc = st.columns([3, 1, 1])
-                    pc[0].write(f"{o.order_id[-8:]}: {o.stock_code} {int(o.strike_price)} {o.action} @ ₹{o.price}")
-                    if pc[1].button("❌ Cancel", key=f"canc_{o.order_id}"):
-                        engine.broker.cancel_order_from_ui(o.order_id, o.exchange_code)
-                        st.rerun()
-                    new_px = pc[2].number_input("New₹", value=o.price, step=0.05, key=f"mod_{o.order_id}", label_visibility="collapsed")
-                    if new_px != o.price:
-                        if st.button(f"✏️ Modify", key=f"modbtn_{o.order_id}"):
-                            engine.broker.modify_order_from_ui(o.order_id, new_px, o.exchange_code)
+                pending = [o for o in orders if str(o.status).lower() in ("pending", "open")]
+                if pending:
+                    st.markdown("Pending order actions")
+                    for o in pending[:10]:
+                        c = st.columns([3, 1, 1, 1.5])
+                        c[0].write(f"{o.order_id[-8:]} {o.exchange_code} {o.stock_code} {int(o.strike_price)} {o.action} @ {o.price}")
+                        if c[1].button("Cancel", key=f"cancel_{o.order_id}"):
+                            engine.broker.cancel_order_from_ui(o.order_id, o.exchange_code)
                             st.rerun()
+                        new_px = c[2].number_input("New", value=float(o.price), step=0.05, key=f"new_{o.order_id}", label_visibility="collapsed")
+                        if c[3].button("Modify", key=f"modify_{o.order_id}"):
+                            engine.broker.modify_order_from_ui(o.order_id, float(new_px), o.exchange_code)
+                            st.rerun()
+            else:
+                st.info("No orders available.")
+
+        with t_trades:
+            if st.button("Refresh trades"):
+                engine.broker.fetch_trades("NFO")
+                engine.broker.fetch_trades("BFO")
+                st.rerun()
+
+            trades = engine.broker.get_trades()
+            if trades:
+                tdf = pd.DataFrame([{
+                    "trade_id": t.trade_id,
+                    "order_id": t.order_id,
+                    "exc": t.exchange_code,
+                    "stock": t.stock_code,
+                    "strike": int(t.strike_price) if t.strike_price else "",
+                    "type": (t.right[:1].upper() if t.right else ""),
+                    "action": t.action,
+                    "qty": t.quantity,
+                    "price": t.trade_price,
+                    "time": t.trade_time,
+                } for t in trades])
+                st.dataframe(tdf, use_container_width=True, height=380, hide_index=True)
+            else:
+                st.info("No trades available.")
+
+        with t_positions:
+            if st.button("Refresh positions"):
+                engine.broker.fetch_positions()
+                st.rerun()
+
+            pos = engine.broker.get_positions()
+            if pos:
+                pdf = pd.DataFrame([{
+                    "stock": p.stock_code,
+                    "exc": p.exchange_code,
+                    "strike": int(p.strike_price),
+                    "type": (p.right[:1].upper() if p.right else ""),
+                    "qty": p.quantity,
+                    "avg": p.avg_price,
+                    "ltp": p.ltp,
+                    "pnl": p.pnl,
+                } for p in pos])
+                st.dataframe(pdf, use_container_width=True, hide_index=True)
+            else:
+                st.info("No broker positions.")
+
+        with t_recon:
+            if st.button("Run reconciliation"):
+                engine.broker.reconcile()
+                st.rerun()
+            issues = engine.broker.get_recon_issues()
+            if issues:
+                for x in issues:
+                    st.warning(x)
+            else:
+                st.success("No reconciliation issues detected.")
+
+
+# ── Tab: Analytics ───────────────────────────────────────────
+with tab_analytics:
+    st.subheader("Analytics")
+
+    if not chain:
+        st.info("Chain required for analytics.")
+    else:
+        # optional analytics module
+        try:
+            from analytics import (
+                calculate_max_pain, calculate_pcr, calculate_expected_move,
+                calculate_skew, generate_payoff, what_if_analysis, calculate_pop,
+                greeks_pnl_attribution,
+            )
+            analytics_ok = True
+        except Exception as e:
+            analytics_ok = False
+            st.warning(f"analytics.py not available: {e}")
+
+        if analytics_ok:
+            spot_here = state.get_spot(breeze_code)
+            mp, curve = calculate_max_pain(chain)
+            pcr = calculate_pcr(chain)
+
+            c = st.columns(3)
+            c[0].metric("Max Pain", f"{int(mp):,}")
+            c[1].metric("PCR (OI)", f"{pcr['pcr_oi']:.2f}")
+            c[2].metric("PCR (Vol)", f"{pcr['pcr_vol']:.2f}")
+
+            if curve:
+                pdf = pd.DataFrame(curve).set_index("strike")
+                st.bar_chart(pdf["total"], height=180)
+
+            # Expected move from ATM straddle
+            if spot_here > 0:
+                atm = atm_strike(spot_here, inst["strike_gap"])
+                atm_ce = [x for x in chain if x["strike"] == atm and x["right"] == "CALL"]
+                atm_pe = [x for x in chain if x["strike"] == atm and x["right"] == "PUT"]
+                if atm_ce and atm_pe:
+                    from greeks_engine import time_to_expiry
+                    dte = time_to_expiry(exp_str) * 365.0
+                    em = calculate_expected_move(spot_here, float(atm_ce[0]["ltp"]), float(atm_pe[0]["ltp"]), dte)
+                    st.metric("Expected Move", f"±{em['expected_move']:,.0f} ({em['em_percent']:.1f}%)")
+                    rcols = st.columns(2)
+                    rcols[0].metric("Upper", f"{em['upper_range']:,.0f}")
+                    rcols[1].metric("Lower", f"{em['lower_range']:,.0f}")
+
+            st.divider()
+            st.markdown("Volatility Skew")
+            skew = calculate_skew(chain, spot_here if spot_here > 0 else 1.0)
+            if skew:
+                sdf = pd.DataFrame(skew)
+                sdf_ce = sdf[sdf["right"] == "CALL"][["strike", "iv"]].rename(columns={"iv": "CE IV"})
+                sdf_pe = sdf[sdf["right"] == "PUT"][["strike", "iv"]].rename(columns={"iv": "PE IV"})
+                sm = pd.merge(sdf_ce, sdf_pe, on="strike", how="outer").set_index("strike")
+                st.line_chart(sm, height=220)
+
+            st.divider()
+            st.markdown("Strategy Payoff / What-if")
+
+            strategies = [s for s in state.get_strategies() if s.status == StrategyStatus.ACTIVE]
+            if strategies:
+                labels = [f"{s.strategy_id} | {s.strategy_type.value}" for s in strategies]
+                choice = st.selectbox("Select strategy", labels)
+                s = strategies[labels.index(choice)]
+
+                pop = calculate_pop(s, spot_here)
+                st.metric("Probability of Profit (approx)", f"{pop:.1f}%")
+
+                pcols = st.columns(2)
+                with pcols[0]:
+                    st.markdown("Payoff at expiry")
+                    payoff = generate_payoff(s, spot_here)
+                    if payoff:
+                        pf = pd.DataFrame(payoff).set_index("spot")
+                        st.line_chart(pf["pnl"], height=220)
+                with pcols[1]:
+                    st.markdown("What-if (mark-to-model)")
+                    wi = what_if_analysis(s, spot_here)
+                    if wi:
+                        wdf = pd.DataFrame(wi)
+                        st.dataframe(wdf, use_container_width=True, hide_index=True, height=260)
+
+                st.markdown("Greeks P&L attribution (small move)")
+                attr = greeks_pnl_attribution(s, spot_change=max(spot_here * 0.005, 1.0))
+                ac = st.columns(5)
+                ac[0].metric("Δ", f"{attr['delta_pnl']:+.0f}")
+                ac[1].metric("Γ", f"{attr['gamma_pnl']:+.0f}")
+                ac[2].metric("Θ", f"{attr['theta_pnl']:+.0f}")
+                ac[3].metric("V", f"{attr['vega_pnl']:+.0f}")
+                ac[4].metric("Total", f"{attr['total_attributed']:+.0f}")
+            else:
+                st.info("No active strategies for payoff analysis.")
+
+    # Adjustments (if adjustment engine active)
+    adj = state.get_adjustments()
+    if adj:
+        st.divider()
+        st.subheader("Adjustment Suggestions")
+        for a in adj:
+            sev = getattr(a, "severity", "INFO")
+            msg = getattr(a, "message", "")
+            det = getattr(a, "details", "")
+            sug = getattr(a, "suggested_action", "")
+            with st.expander(f"[{sev}] {msg}"):
+                if det:
+                    st.write(det)
+                if sug:
+                    st.info(sug)
+
+
+# ── Tab: Journal ─────────────────────────────────────────────
+with tab_journal:
+    st.subheader("Journal")
+
+    if not getattr(engine, "journal", None):
+        st.info("journal.py not available in this build.")
+    else:
+        stats = engine.journal.get_stats()
+        if stats.total_trades <= 0:
+            st.info("No journal entries yet.")
         else:
-            st.info("No orders today.")
+            c = st.columns(4)
+            c[0].metric("Trades", stats.total_trades)
+            c[1].metric("Win rate", f"{stats.win_rate:.1f}%")
+            c[2].metric("Profit factor", f"{stats.profit_factor:.2f}")
+            c[3].metric("Total P&L", f"₹{stats.total_pnl:+,.0f}")
 
-    with bt3:
-        st.markdown("**Today's Trades**")
-        if st.button("🔄 Refresh Trades"):
-            engine.broker.fetch_trades()
-            engine.broker.fetch_trades("BFO")
-            st.rerun()
+            c2 = st.columns(4)
+            c2[0].metric("Max DD", f"₹{stats.max_drawdown:,.0f}")
+            c2[1].metric("Avg win", f"₹{stats.avg_win:,.0f}")
+            c2[2].metric("Avg loss", f"₹{-stats.avg_loss:,.0f}")
+            c2[3].metric("Expectancy", f"₹{stats.expectancy:+,.0f}")
 
-        trades = engine.broker.get_trades()
-        if trades:
-            tdf = pd.DataFrame([{
-                "TradeID": t.trade_id, "OrderID": t.order_id[-8:] if len(t.order_id)>8 else t.order_id,
-                "Stock": t.stock_code, "Strike": int(t.strike_price) if t.strike_price else "",
-                "Type": t.right[:1].upper() if t.right else "",
-                "Action": t.action, "Qty": t.quantity,
-                "Price": t.trade_price, "Time": t.trade_time,
-            } for t in trades])
-            st.dataframe(tdf, use_container_width=True, hide_index=True, height=400)
+        st.divider()
+        st.markdown("Recent entries")
+        entries = engine.journal.get_entries(50)
+        if entries:
+            edf = pd.DataFrame([{
+                "exit_date": e.exit_date[:19],
+                "type": e.strategy_type,
+                "stock": e.stock_code,
+                "legs": e.legs_count,
+                "pnl": e.pnl,
+                "reason": e.exit_reason,
+                "dur_min": e.duration_minutes,
+            } for e in entries])
+            st.dataframe(edf, use_container_width=True, hide_index=True, height=360)
 
-            # Realized P&L from trades
-            realized = 0.0
-            for t in trades:
-                if t.action.lower() == "sell":
-                    realized += t.trade_price * t.quantity
-                else:
-                    realized -= t.trade_price * t.quantity
-            st.metric("Realized P&L (from trades)", f"₹{realized:+,.2f}")
-        else:
-            st.info("No trades today.")
-
-    with bt4:
-        st.markdown("**Broker Positions (live from API)**")
-        if st.button("🔄 Refresh Positions"):
-            engine.broker.fetch_positions()
-            st.rerun()
-
-        bpos = engine.broker.get_positions()
-        if bpos:
-            pdf = pd.DataFrame([{
-                "Stock": p.stock_code, "Strike": int(p.strike_price),
-                "Type": p.right[:1].upper() if p.right else "",
-                "Qty": p.quantity, "Avg": p.avg_price,
-                "LTP": p.ltp,
-                "P&L": round((p.avg_price - p.ltp) * abs(p.quantity) if p.quantity < 0
-                       else (p.ltp - p.avg_price) * p.quantity, 2),
-                "Exchange": p.exchange_code,
-            } for p in bpos])
-            st.dataframe(pdf, use_container_width=True, hide_index=True)
-        else:
-            st.info("No broker positions.")
+        st.divider()
+        st.markdown("Daily P&L")
+        daily = engine.journal.get_daily_pnl(30)
+        if daily:
+            ddf = pd.DataFrame(daily)
+            st.line_chart(ddf.set_index("date")["total"], height=200)
+            st.dataframe(ddf, use_container_width=True, hide_index=True)
 
 
-# ── TAB 5: DASHBOARD ────────────────────────────────────────
+# ── Tab: Backtest ────────────────────────────────────────────
+with tab_backtest:
+    st.subheader("Backtest")
 
-with t5:
-    st.subheader("📊 Dashboard")
-    d1, d2 = st.columns(2)
+    if not getattr(engine, "backtester", None):
+        st.info("backtester.py not available in this build.")
+    else:
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            bt_inst = st.selectbox("Instrument", list(INSTRUMENTS.keys()), key="bt_inst")
+            bt_strategy = st.selectbox("Strategy", ["strangle", "straddle"], key="bt_strategy")
+            bt_delta = st.slider("Delta (strangle)", 0.05, 0.40, 0.15, 0.01, key="bt_delta")
+            bt_sl = st.slider("SL %", 10, 200, 50, key="bt_sl")
+        with bc2:
+            bt_dte = st.slider("Entry DTE", 1, 15, 5, key="bt_dte")
+            bt_iv = st.slider("IV assumption %", 5, 50, 15, key="bt_iv")
+            bt_lots = st.number_input("Lots", 1, 10, 1, key="bt_lots")
+            bt_days = st.slider("Lookback days", 30, 730, 365, key="bt_days")
 
-    with d1:
-        st.markdown("**Portfolio Greeks**")
-        pg = state.get_portfolio_greeks()
-        gc = st.columns(4)
-        gc[0].metric("Net Δ", f"{pg.delta:+.1f}", help="0 = neutral")
-        gc[1].metric("Net Γ", f"{pg.gamma:+.4f}")
-        gc[2].metric("Net Θ", f"₹{pg.theta:+.1f}/day")
-        gc[3].metric("Net V", f"{pg.vega:+.1f}")
-        if abs(pg.delta) > 50:
-            st.warning(f"⚠️ Delta {pg.delta:+.1f} — consider adjusting")
+        if st.button("Run backtest", type="primary", use_container_width=True):
+            with st.spinner("Running..."):
+                start = (datetime.now() - timedelta(days=int(bt_days))).strftime("%Y-%m-%d")
+                res = engine.run_backtest(
+                    instrument=bt_inst,
+                    strategy=bt_strategy,
+                    start_date=start,
+                    end_date=datetime.now().strftime("%Y-%m-%d"),
+                    entry_dte=int(bt_dte),
+                    target_delta=float(bt_delta),
+                    sl_pct=float(bt_sl),
+                    iv_assumption=float(bt_iv) / 100.0,
+                    lots=int(bt_lots),
+                )
 
-    with d2:
-        st.markdown("**Intraday MTM**")
-        hist = state.get_mtm_history()
-        if hist and len(hist) > 2:
-            mdf = pd.DataFrame(hist)
-            st.line_chart(mdf.set_index("time")["mtm"], height=200)
-        else:
-            st.info("Collecting data...")
+            # Render results (res is a dataclass in backtester.py)
+            if getattr(res, "total_trades", 0) <= 0:
+                st.warning("No trades generated.")
+            else:
+                c = st.columns(4)
+                c[0].metric("Trades", res.total_trades)
+                c[1].metric("Total P&L", f"₹{res.total_pnl:+,.0f}")
+                c[2].metric("Win rate", f"{res.win_rate:.1f}%")
+                c[3].metric("Max DD", f"₹{res.max_drawdown:,.0f}")
 
-    st.divider()
-    cc = st.columns(4)
-    cc[0].markdown(f"**SL:** {Config.SL_PERCENTAGE}%")
-    cc[1].markdown(f"**Trail:** {'ON' if Config.TRAIL_ENABLED else 'OFF'} ({Config.TRAIL_ACTIVATION_PCT}%→{Config.TRAIL_SL_PCT}%)")
-    cc[2].markdown(f"**Auto-exit:** {Config.AUTO_EXIT_HOUR}:{Config.AUTO_EXIT_MINUTE:02d}")
-    cc[3].markdown(f"**Max Loss:** ₹{Config.GLOBAL_MAX_LOSS:,.0f}")
+                st.markdown("Equity curve")
+                st.line_chart(res.equity_curve, height=250)
 
-    # Strategy history
-    st.divider()
-    st.markdown("**Strategy History (last 50)**")
-    try:
-        all_s = engine.db.get_all_strategies()
-        if all_s:
-            hdf = pd.DataFrame([{
-                "ID": s.strategy_id, "Type": s.strategy_type.value,
-                "Stock": s.stock_code, "P&L": round(s.total_pnl, 2),
-                "Status": s.status.value, "Created": s.created_at[:19] if s.created_at else "",
-                "Closed": s.closed_at[:19] if s.closed_at else "",
-            } for s in all_s])
-            st.dataframe(hdf, use_container_width=True, hide_index=True)
-    except: pass
+                if res.trades:
+                    tdf = pd.DataFrame([{
+                        "entry": t.entry_date,
+                        "exit": t.exit_date,
+                        "entry_spot": t.entry_spot,
+                        "exit_spot": t.exit_spot,
+                        "ce_k": int(t.ce_strike),
+                        "pe_k": int(t.pe_strike),
+                        "pnl": t.pnl,
+                        "reason": t.exit_reason,
+                    } for t in res.trades])
+                    st.dataframe(tdf, use_container_width=True, hide_index=True, height=380)
 
 
-# ── TAB 6: LOGS ─────────────────────────────────────────────
-
-with t6:
+# ── Tab: Logs ────────────────────────────────────────────────
+with tab_logs:
     st.subheader("Logs")
-    l1, l2 = st.columns([3, 2])
-    with l1:
-        logs = state.get_logs(150)
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        logs = state.get_logs(200)
         if logs:
             lines = []
             for e in reversed(logs):
-                c = {"INFO":"#88ccff","WARN":"#ffcc44","ERROR":"#ff4444","CRIT":"#ff0000"}.get(e.level,"#ccc")
-                lines.append(f'<span style="color:{c}">[{e.timestamp}] {e.level:5s}</span> | {e.source:8s} | {e.message}')
-            st.markdown('<div class="lb">'+"<br>".join(lines)+'</div>', unsafe_allow_html=True)
+                color = {"INFO": "#88ccff", "WARN": "#ffcc44", "ERROR": "#ff4444", "CRIT": "#ff0000"}.get(e.level, "#cccccc")
+                lines.append(
+                    f'<span style="color:{color}">[{e.timestamp}] {e.level:5s}</span>'
+                    f' | <span style="color:#888">{e.source:10s}</span>'
+                    f' | {e.message}'
+                )
+            st.markdown('<div class="logbox">' + "<br>".join(lines) + "</div>", unsafe_allow_html=True)
         else:
-            st.info("No logs.")
-    with l2:
-        st.markdown("**Order Log**")
+            st.info("No logs yet.")
+
+    with c2:
+        st.markdown("Order Log (DB)")
         try:
-            ol = engine.db.get_recent_logs(30)
+            ol = engine.db.get_recent_logs(50) if hasattr(engine.db, "get_recent_logs") else engine.db.get_recent_order_logs(50)
             if ol:
-                st.dataframe(pd.DataFrame(ol)[[c for c in ["timestamp","action","status","price","quantity","order_id","message"] if c in pd.DataFrame(ol).columns]], use_container_width=True, hide_index=True, height=380)
-            else: st.info("No orders.")
-        except: pass
-
-
-# ── FOOTER ───────────────────────────────────────────────────
-
-st.divider()
-fc = st.columns(5)
-fc[0].caption(f"Mode: **{Config.TRADING_MODE.upper()}**")
-fc[1].caption(f"DB: `{Config.DB_PATH}`")
-fc[2].caption(f"Active: {sum(1 for s in strategies if s.status==StrategyStatus.ACTIVE)}")
-fc[3].caption(f"{datetime.now().strftime('%H:%M:%S')}")
-fc[4].markdown("🚨 **PANIC**" if state.panic_triggered else f"Engine: {'✓' if state.engine_running else '✗'}")
+                odf = pd.DataFrame(ol)
+                cols = [c for c in ["timestamp", "action", "status", "price", "quantity", "order_id", "message"] if c in odf.columns]
+                st.dataframe(odf[cols], use_container_width=True, hide_index=True, height=420)
+            else:
+                st.info("No DB order logs.")
+        except Exception as e:
+            st.warning(f"Order log error: {e}")
