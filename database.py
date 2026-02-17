@@ -1,13 +1,11 @@
 # ═══════════════════════════════════════════════════════════════
-# FILE: database.py
+# FILE: database.py  (UPDATED — new queries for pending monitor)
 # ═══════════════════════════════════════════════════════════════
 """
-SQLite persistence with trailing SL columns and schema versioning.
+SQLite persistence — added get_legs_by_status and get_active_legs.
 """
 
-import sqlite3
-import threading
-import json
+import sqlite3, threading, json
 from typing import List
 from datetime import datetime
 from models import (Strategy, Leg, StrategyType, StrategyStatus,
@@ -16,8 +14,6 @@ from app_config import Config
 
 
 class Database:
-    SCHEMA_VERSION = 3
-
     def __init__(self, db_path: str = Config.DB_PATH):
         self._path = db_path
         self._local = threading.local()
@@ -35,13 +31,11 @@ class Database:
     def _init(self):
         with self._conn:
             self._conn.executescript("""
-                CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS strategies (
                     strategy_id TEXT PRIMARY KEY, strategy_type TEXT NOT NULL,
                     stock_code TEXT NOT NULL, target_delta REAL DEFAULT 0,
                     total_pnl REAL DEFAULT 0, status TEXT DEFAULT 'deploying',
-                    created_at TEXT, closed_at TEXT
-                );
+                    created_at TEXT, closed_at TEXT);
                 CREATE TABLE IF NOT EXISTS legs (
                     leg_id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL,
                     stock_code TEXT NOT NULL, exchange_code TEXT DEFAULT 'NFO',
@@ -54,14 +48,12 @@ class Database:
                     entry_order_id TEXT DEFAULT '', exit_order_id TEXT DEFAULT '',
                     status TEXT DEFAULT 'pending', entry_time TEXT, exit_time TEXT,
                     pnl REAL DEFAULT 0, greeks_json TEXT DEFAULT '{}',
-                    FOREIGN KEY (strategy_id) REFERENCES strategies(strategy_id)
-                );
+                    FOREIGN KEY (strategy_id) REFERENCES strategies(strategy_id));
                 CREATE TABLE IF NOT EXISTS order_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL, leg_id TEXT, order_id TEXT,
                     action TEXT, status TEXT, price REAL,
-                    quantity INTEGER, message TEXT
-                );
+                    quantity INTEGER, message TEXT);
                 CREATE INDEX IF NOT EXISTS idx_legs_sid ON legs(strategy_id);
                 CREATE INDEX IF NOT EXISTS idx_legs_st ON legs(status);
             """)
@@ -69,25 +61,17 @@ class Database:
     def save_strategy(self, s: Strategy):
         with self._conn:
             self._conn.execute(
-                """INSERT OR REPLACE INTO strategies
-                   (strategy_id,strategy_type,stock_code,target_delta,
-                    total_pnl,status,created_at,closed_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                "INSERT OR REPLACE INTO strategies VALUES (?,?,?,?,?,?,?,?)",
                 (s.strategy_id, s.strategy_type.value, s.stock_code,
                  s.target_delta, s.total_pnl, s.status.value,
                  s.created_at, s.closed_at))
 
     def save_leg(self, l: Leg):
-        gj = json.dumps({"delta": l.greeks.delta, "gamma": l.greeks.gamma,
-                          "theta": l.greeks.theta, "vega": l.greeks.vega, "iv": l.greeks.iv})
+        gj = json.dumps({"delta":l.greeks.delta,"gamma":l.greeks.gamma,
+                          "theta":l.greeks.theta,"vega":l.greeks.vega,"iv":l.greeks.iv})
         with self._conn:
             self._conn.execute(
-                """INSERT OR REPLACE INTO legs
-                   (leg_id,strategy_id,stock_code,exchange_code,strike_price,
-                    right,expiry_date,side,quantity,entry_price,current_price,
-                    exit_price,sl_price,sl_percentage,lowest_price,trailing_active,
-                    entry_order_id,exit_order_id,status,entry_time,exit_time,pnl,greeks_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                "INSERT OR REPLACE INTO legs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (l.leg_id, l.strategy_id, l.stock_code, l.exchange_code,
                  l.strike_price, l.right.value, l.expiry_date, l.side.value,
                  l.quantity, l.entry_price, l.current_price, l.exit_price,
@@ -97,22 +81,17 @@ class Database:
                  l.entry_time, l.exit_time, l.pnl, gj))
 
     def update_leg_price(self, lid, price, pnl, sl=None, lowest=None, trailing=None):
-        sets = ["current_price=?", "pnl=?"]
-        vals = [price, pnl]
-        if sl is not None:
-            sets.append("sl_price=?"); vals.append(sl)
-        if lowest is not None:
-            sets.append("lowest_price=?"); vals.append(lowest)
-        if trailing is not None:
-            sets.append("trailing_active=?"); vals.append(1 if trailing else 0)
+        sets, vals = ["current_price=?","pnl=?"], [price, pnl]
+        if sl is not None: sets.append("sl_price=?"); vals.append(sl)
+        if lowest is not None: sets.append("lowest_price=?"); vals.append(lowest)
+        if trailing is not None: sets.append("trailing_active=?"); vals.append(1 if trailing else 0)
         vals.append(lid)
         with self._conn:
             self._conn.execute(f"UPDATE legs SET {','.join(sets)} WHERE leg_id=?", vals)
 
     def update_leg_status(self, lid, status: LegStatus, **kw):
         sets, vals = ["status=?"], [status.value]
-        for k, v in kw.items():
-            sets.append(f"{k}=?"); vals.append(v)
+        for k,v in kw.items(): sets.append(f"{k}=?"); vals.append(v)
         vals.append(lid)
         with self._conn:
             self._conn.execute(f"UPDATE legs SET {','.join(sets)} WHERE leg_id=?", vals)
@@ -124,15 +103,43 @@ class Database:
         out = []
         for r in rows:
             s = Strategy(strategy_id=r["strategy_id"],
-                         strategy_type=StrategyType(r["strategy_type"]),
-                         stock_code=r["stock_code"], target_delta=r["target_delta"],
-                         total_pnl=r["total_pnl"], status=StrategyStatus(r["status"]),
-                         created_at=r["created_at"], closed_at=r["closed_at"])
-            s.legs = self._legs_for(s.strategy_id)
+                strategy_type=StrategyType(r["strategy_type"]),
+                stock_code=r["stock_code"], target_delta=r["target_delta"],
+                total_pnl=r["total_pnl"], status=StrategyStatus(r["status"]),
+                created_at=r["created_at"], closed_at=r["closed_at"])
+            s.legs = self._legs(s.strategy_id)
             out.append(s)
         return out
 
-    def _legs_for(self, sid) -> List[Leg]:
+    def get_all_strategies(self) -> List[Strategy]:
+        rows = self._conn.execute(
+            "SELECT * FROM strategies ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        out = []
+        for r in rows:
+            s = Strategy(strategy_id=r["strategy_id"],
+                strategy_type=StrategyType(r["strategy_type"]),
+                stock_code=r["stock_code"], target_delta=r["target_delta"],
+                total_pnl=r["total_pnl"], status=StrategyStatus(r["status"]),
+                created_at=r["created_at"], closed_at=r["closed_at"])
+            s.legs = self._legs(s.strategy_id)
+            out.append(s)
+        return out
+
+    def get_legs_by_status(self, status: LegStatus) -> List[Leg]:
+        """Used by PendingOrderMonitor to find ENTERING legs."""
+        rows = self._conn.execute(
+            "SELECT * FROM legs WHERE status=?", (status.value,)
+        ).fetchall()
+        return [self._to_leg(r) for r in rows]
+
+    def get_active_legs(self) -> List[Leg]:
+        rows = self._conn.execute(
+            "SELECT * FROM legs WHERE status IN ('active','entering')"
+        ).fetchall()
+        return [self._to_leg(r) for r in rows]
+
+    def _legs(self, sid) -> List[Leg]:
         rows = self._conn.execute("SELECT * FROM legs WHERE strategy_id=?", (sid,)).fetchall()
         return [self._to_leg(r) for r in rows]
 
@@ -166,5 +173,4 @@ class Database:
 
     def close(self):
         if hasattr(self._local, "conn") and self._local.conn:
-            self._local.conn.close()
-            self._local.conn = None
+            self._local.conn.close(); self._local.conn = None
