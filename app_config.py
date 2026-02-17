@@ -29,22 +29,28 @@ def _get(key: str, default: str = "") -> str:
         pass
     return os.environ.get(key, "") or default
 
+# Add to INSTRUMENTS, inside each instrument dict:
+#   "cash_code": "<CODE>",    # for historical data (NSE/BSE cash segment)
+#   "cash_exchange": "<EXC>",
 
 INSTRUMENTS = {
     "NIFTY": {
         "breeze_code": "NIFTY", "display": "NIFTY 50", "exchange": "NFO",
         "lot_size": int(_get("NIFTY_LOT_SIZE", "65")),
         "strike_gap": 50, "expiry_weekday": 1,
+        "cash_code": "NIFTY", "cash_exchange": "NSE",
     },
     "BANKNIFTY": {
         "breeze_code": "CNXBAN", "display": "Bank NIFTY", "exchange": "NFO",
         "lot_size": int(_get("BANKNIFTY_LOT_SIZE", "15")),
         "strike_gap": 100, "expiry_weekday": 2,
+        "cash_code": "CNXBAN", "cash_exchange": "NSE",
     },
     "SENSEX": {
         "breeze_code": "BSESEN", "display": "SENSEX", "exchange": "BFO",
         "lot_size": int(_get("SENSEX_LOT_SIZE", "20")),
         "strike_gap": 100, "expiry_weekday": 3,
+        "cash_code": "BSESEN", "cash_exchange": "BSE",
     },
 }
 
@@ -75,6 +81,12 @@ class Config:
     MARGIN_BUFFER_PCT: float = float(_get("MARGIN_BUFFER_PCT", "10"))
     PENDING_POLL_INTERVAL: float = float(_get("PENDING_POLL_INTERVAL", "10"))
     BROKER_SYNC_INTERVAL: float = float(_get("BROKER_SYNC_INTERVAL", "30"))
+    ADJUSTMENT_THRESHOLD: float = float(_get("ADJUSTMENT_THRESHOLD", "30"))
+    AUTO_ADJUST: bool = _get("AUTO_ADJUST", "false").lower() == "true"
+    TELEGRAM_BOT_TOKEN: str = _get("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = _get("TELEGRAM_CHAT_ID", "")
+    WEBHOOK_URL: str = _get("WEBHOOK_URL", "")
+    BACKTEST_DEFAULT_DAYS: int = int(_get("BACKTEST_DEFAULT_DAYS", "180"))
 
     @classmethod
     def is_live(cls) -> bool:
