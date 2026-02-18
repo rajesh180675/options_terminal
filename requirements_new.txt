@@ -1,0 +1,24 @@
+# ═══════════════════════════════════════════════════════════════
+# FILE: requirements.txt
+# ═══════════════════════════════════════════════════════════════
+# Original requirements (unchanged)
+breeze-connect>=1.0.50
+streamlit>=1.32.0
+streamlit-autorefresh>=1.0.1
+scipy>=1.11.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+pyotp>=2.9.0
+
+# ── NEW: Added for enhancement modules ──────────────────────────
+# Used by alerts.py → Telegram notifications
+requests>=2.28.0
+
+# Used by scanner.py, iv_surface.py, heatmap_engine.py
+# (numpy already included above, but pinning for clarity)
+numpy>=1.24.0
+
+# Optional: plotly for richer interactive charts in Streamlit pages
+# Uncomment if you want Plotly charts in pages/
+# plotly>=5.18.0
